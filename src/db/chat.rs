@@ -302,6 +302,202 @@ pub async fn update_tool_call_result(
     Ok(())
 }
 
+// ── Permission CRUD ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRule {
+    pub id: i64,
+    pub tool_name: String,
+    pub path_pattern: Option<String>,
+    pub workspace: Option<String>,
+    pub scope: String,
+    pub behavior: String,
+    pub session_id: Option<i64>,
+    pub created_at: i64,
+}
+
+fn row_to_permission(row: &sqlx::sqlite::SqliteRow) -> PermissionRule {
+    PermissionRule {
+        id: row.get("id"),
+        tool_name: row.get("tool_name"),
+        path_pattern: row.get("path_pattern"),
+        workspace: row.get("workspace"),
+        scope: row.get("scope"),
+        behavior: row.get("behavior"),
+        session_id: row.get("session_id"),
+        created_at: row.get("created_at"),
+    }
+}
+
+/// Check for a matching permission rule. Checks persisted ('always') first, then session-scoped.
+pub async fn check_permission(
+    pool: &SqlitePool,
+    tool_name: &str,
+    workspace: Option<&str>,
+    session_id: i64,
+) -> Result<Option<PermissionRule>, String> {
+    // 1. Check 'always' rules (workspace-specific first, then global)
+    let row = sqlx::query(
+        "SELECT * FROM tool_permissions WHERE tool_name = ? AND scope = 'always' \
+         AND (workspace = ? OR workspace IS NULL) \
+         ORDER BY CASE WHEN workspace IS NOT NULL THEN 0 ELSE 1 END LIMIT 1"
+    )
+    .bind(tool_name)
+    .bind(workspace)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to check permission: {e}"))?;
+
+    if let Some(row) = row {
+        return Ok(Some(row_to_permission(&row)));
+    }
+
+    // 2. Check 'session' rules
+    let row = sqlx::query(
+        "SELECT * FROM tool_permissions WHERE tool_name = ? AND scope = 'session' \
+         AND session_id = ? LIMIT 1"
+    )
+    .bind(tool_name)
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to check session permission: {e}"))?;
+
+    Ok(row.as_ref().map(row_to_permission))
+}
+
+pub async fn insert_permission(
+    pool: &SqlitePool,
+    tool_name: &str,
+    path_pattern: Option<&str>,
+    workspace: Option<&str>,
+    scope: &str,
+    behavior: &str,
+    session_id: Option<i64>,
+) -> Result<PermissionRule, String> {
+    let row = sqlx::query(
+        "INSERT INTO tool_permissions (tool_name, path_pattern, workspace, scope, behavior, session_id) \
+         VALUES (?, ?, ?, ?, ?, ?) RETURNING *"
+    )
+    .bind(tool_name)
+    .bind(path_pattern)
+    .bind(workspace)
+    .bind(scope)
+    .bind(behavior)
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("Failed to insert permission: {e}"))?;
+
+    Ok(row_to_permission(&row))
+}
+
+pub async fn delete_permission(pool: &SqlitePool, id: i64) -> Result<(), String> {
+    sqlx::query("DELETE FROM tool_permissions WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to delete permission: {e}"))?;
+    Ok(())
+}
+
+pub async fn list_permissions(
+    pool: &SqlitePool,
+    workspace: Option<&str>,
+) -> Result<Vec<PermissionRule>, String> {
+    let rows = if let Some(ws) = workspace {
+        sqlx::query(
+            "SELECT * FROM tool_permissions WHERE (workspace = ? OR workspace IS NULL) \
+             ORDER BY created_at DESC"
+        )
+        .bind(ws)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query("SELECT * FROM tool_permissions ORDER BY created_at DESC")
+            .fetch_all(pool)
+            .await
+    }
+    .map_err(|e| format!("Failed to list permissions: {e}"))?;
+
+    Ok(rows.iter().map(row_to_permission).collect())
+}
+
+pub async fn clear_session_permissions(
+    pool: &SqlitePool,
+    session_id: i64,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM tool_permissions WHERE scope = 'session' AND session_id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to clear session permissions: {e}"))?;
+    Ok(())
+}
+
+// ── Usage stats ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyUsage {
+    pub date: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+}
+
+pub async fn upsert_usage(
+    pool: &SqlitePool,
+    session_id: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO usage_stats (date, session_id, input_tokens, output_tokens, cache_read_tokens) \
+         VALUES (date('now'), ?, ?, ?, ?) \
+         ON CONFLICT (date, session_id) DO UPDATE SET \
+             input_tokens = input_tokens + excluded.input_tokens, \
+             output_tokens = output_tokens + excluded.output_tokens, \
+             cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens"
+    )
+    .bind(session_id)
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(cache_read_tokens)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to upsert usage: {e}"))?;
+    Ok(())
+}
+
+pub async fn get_usage_by_date_range(
+    pool: &SqlitePool,
+    from: &str,
+    to: &str,
+) -> Result<Vec<DailyUsage>, String> {
+    let rows = sqlx::query(
+        "SELECT date, SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens, \
+         SUM(cache_read_tokens) as cache_read_tokens \
+         FROM usage_stats WHERE date >= ? AND date <= ? \
+         GROUP BY date ORDER BY date ASC"
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to get usage: {e}"))?;
+
+    Ok(rows
+        .iter()
+        .map(|r| DailyUsage {
+            date: r.get("date"),
+            input_tokens: r.get("input_tokens"),
+            output_tokens: r.get("output_tokens"),
+            cache_read_tokens: r.get("cache_read_tokens"),
+        })
+        .collect())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use std::str::FromStr;
 const MIGRATION_SQL: &str = include_str!("../../migrations/001_initial.sql");
 const MIGRATION_002_SQL: &str = include_str!("../../migrations/002_env_is_secret.sql");
 const MIGRATION_003_SQL: &str = include_str!("../../migrations/003_chat.sql");
+const MIGRATION_004_SQL: &str = include_str!("../../migrations/004_permissions.sql");
 
 pub async fn init_db(app_data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
     std::fs::create_dir_all(app_data_dir).ok();
@@ -55,6 +56,14 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let trimmed = statement.trim();
         if !trimmed.is_empty() {
             sqlx::query(trimmed).execute(pool).await?;
+        }
+    }
+
+    // Permission rules + messages.cache_read_tokens (idempotent: CREATE IF NOT EXISTS + ALTER may fail)
+    for statement in MIGRATION_004_SQL.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            let _ = sqlx::query(trimmed).execute(pool).await;
         }
     }
 
