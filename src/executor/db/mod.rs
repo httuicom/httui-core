@@ -23,6 +23,9 @@ fn default_fetch_size() -> u32 {
     80
 }
 
+const MAX_FETCH_SIZE: u32 = 1000;
+const MAX_OFFSET: u32 = 1_000_000;
+
 pub struct DbExecutor {
     conn_manager: Arc<PoolManager>,
 }
@@ -52,6 +55,12 @@ impl Executor for DbExecutor {
         if p.fetch_size == 0 {
             return Err("fetch_size must be >= 1".to_string());
         }
+        if p.fetch_size > MAX_FETCH_SIZE {
+            return Err(format!("fetch_size must be <= {MAX_FETCH_SIZE}"));
+        }
+        if p.offset > MAX_OFFSET {
+            return Err(format!("offset must be <= {MAX_OFFSET}"));
+        }
 
         Ok(())
     }
@@ -66,25 +75,43 @@ impl Executor for DbExecutor {
             .await
             .map_err(ExecutorError)?;
 
-        let start = Instant::now();
-
-        // Apply timeout if specified
-        let result = if let Some(timeout_ms) = p.timeout_ms {
-            let timeout = std::time::Duration::from_millis(timeout_ms);
-            tokio::time::timeout(
-                timeout,
-                pool.execute_query(&p.query, &p.bind_values, p.offset, p.fetch_size),
-            )
-            .await
-            .map_err(|_| ExecutorError(format!("Query timed out after {}ms", timeout_ms)))?
-            .map_err(ExecutorError)?
+        // Resolve timeout: explicit per-query > connection default > 30s fallback
+        let effective_timeout_ms = if let Some(t) = p.timeout_ms {
+            t
         } else {
-            pool.execute_query(&p.query, &p.bind_values, p.offset, p.fetch_size)
+            self.conn_manager
+                .get_query_timeout(&p.connection_id)
                 .await
-                .map_err(ExecutorError)?
+                .unwrap_or(30_000)
         };
 
+        let start = Instant::now();
+        let timeout = std::time::Duration::from_millis(effective_timeout_ms);
+
+        let result = tokio::time::timeout(
+            timeout,
+            pool.execute_query(&p.query, &p.bind_values, p.offset, p.fetch_size),
+        )
+        .await
+        .map_err(|_| ExecutorError(format!("Query timed out after {}ms", effective_timeout_ms)))?
+        .map_err(ExecutorError);
+
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        // T30: Audit log — log both success and failure
+        let truncated_query: String = p.query.chars().take(500).collect();
+        let status = if result.is_ok() { "success" } else { "error" };
+        let _ = sqlx::query(
+            "INSERT INTO query_log (connection_id, query, status, duration_ms) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&p.connection_id)
+        .bind(&truncated_query)
+        .bind(status)
+        .bind(duration_ms as i64)
+        .execute(self.conn_manager.app_pool())
+        .await;
+
+        let result = result?;
 
         if result.is_select {
             let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();

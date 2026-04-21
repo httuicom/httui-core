@@ -7,6 +7,8 @@ use crate::executor::{BlockRequest, BlockResult, ExecutorRegistry};
 use crate::parser::{self, ParsedBlock};
 use crate::references;
 
+const MAX_DEPENDENCY_DEPTH: usize = 50;
+
 /// Errors from the block runner.
 #[derive(Debug)]
 pub enum RunnerError {
@@ -84,6 +86,7 @@ impl BlockRunner {
             &env_vars,
             &mut executed,
             &mut in_progress,
+            0,
         )
         .await
     }
@@ -96,8 +99,15 @@ impl BlockRunner {
         env_vars: &'a HashMap<String, String>,
         executed: &'a mut HashMap<String, serde_json::Value>,
         in_progress: &'a mut HashSet<String>,
+        depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BlockResult, RunnerError>> + Send + 'a>> {
         Box::pin(async move {
+        // T36: Depth limit to prevent stack overflow from deep chains
+        if depth > MAX_DEPENDENCY_DEPTH {
+            return Err(RunnerError::DependencyFailed(format!(
+                "Dependency chain exceeds maximum depth of {MAX_DEPENDENCY_DEPTH}"
+            )));
+        }
         // Already executed? Return cached result
         if let Some(data) = executed.get(alias) {
             return Ok(BlockResult {
@@ -141,6 +151,7 @@ impl BlockRunner {
                             env_vars,
                             executed,
                             in_progress,
+                            depth + 1,
                         )
                         .await
                         .map_err(|e| {

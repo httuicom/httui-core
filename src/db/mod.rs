@@ -4,14 +4,19 @@ pub mod environments;
 pub mod keychain;
 pub mod schema_cache;
 
+use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::{Column, Row, TypeInfo};
 use std::path::Path;
 use std::str::FromStr;
+
+use connections::{contains_multiple_statements, sanitize_query_error, sqlite_row_to_json, ColumnInfo, JsonRow};
 
 const MIGRATION_SQL: &str = include_str!("../../migrations/001_initial.sql");
 const MIGRATION_002_SQL: &str = include_str!("../../migrations/002_env_is_secret.sql");
 const MIGRATION_003_SQL: &str = include_str!("../../migrations/003_chat.sql");
 const MIGRATION_004_SQL: &str = include_str!("../../migrations/004_permissions.sql");
+const MIGRATION_005_SQL: &str = include_str!("../../migrations/005_audit_log.sql");
 
 pub async fn init_db(app_data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
     std::fs::create_dir_all(app_data_dir).ok();
@@ -30,7 +35,92 @@ pub async fn init_db(app_data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
 
     run_migrations(&pool).await?;
 
+    // T33: Restrict file permissions on Unix (owner-only read/write)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if db_path.exists() {
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
     Ok(pool)
+}
+
+// --- Internal DB query (read-only, for audit/settings UI) ---
+
+const MAX_INTERNAL_FETCH_SIZE: u32 = 500;
+const MAX_INTERNAL_OFFSET: u32 = 100_000;
+
+#[derive(Debug, Serialize)]
+pub struct InternalQueryResult {
+    pub columns: Vec<ColumnInfo>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub has_more: bool,
+}
+
+/// Execute a read-only query against the app's internal SQLite database.
+/// Only SELECT, WITH, read-only PRAGMA, and EXPLAIN are allowed.
+pub async fn query_internal_db(
+    pool: &SqlitePool,
+    sql: &str,
+    offset: u32,
+    fetch_size: u32,
+) -> Result<InternalQueryResult, String> {
+    let trimmed = sql.trim_start();
+    let upper = trimmed.to_uppercase();
+
+    // Enforce read-only
+    let allowed = upper.starts_with("SELECT")
+        || upper.starts_with("WITH")
+        || upper.starts_with("EXPLAIN")
+        || (upper.starts_with("PRAGMA") && !upper.contains('='));
+
+    if !allowed {
+        return Err("Only SELECT queries are allowed on the internal database".to_string());
+    }
+
+    if contains_multiple_statements(trimmed) {
+        return Err("Multi-statement queries are not allowed".to_string());
+    }
+
+    let fetch_size = fetch_size.min(MAX_INTERNAL_FETCH_SIZE).max(1);
+    let offset = offset.min(MAX_INTERNAL_OFFSET);
+
+    let limit = (fetch_size + 1) as i64;
+    let off = offset as i64;
+    let paginated_sql = format!("SELECT * FROM ({trimmed}) LIMIT {limit} OFFSET {off}");
+
+    let mut rows = sqlx::query(&paginated_sql)
+        .fetch_all(pool)
+        .await
+        .map_err(sanitize_query_error)?;
+
+    let has_more = rows.len() > fetch_size as usize;
+    if has_more {
+        rows.pop();
+    }
+
+    let columns: Vec<ColumnInfo> = if let Some(first) = rows.first() {
+        first
+            .columns()
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name().to_string(),
+                type_name: c.type_info().name().to_string(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let json_rows: Vec<JsonRow> = rows.iter().map(|row| sqlite_row_to_json(row)).collect();
+
+    Ok(InternalQueryResult {
+        columns,
+        rows: json_rows,
+        has_more,
+    })
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -61,6 +151,14 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     // Permission rules + messages.cache_read_tokens (idempotent: CREATE IF NOT EXISTS + ALTER may fail)
     for statement in MIGRATION_004_SQL.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            let _ = sqlx::query(trimmed).execute(pool).await;
+        }
+    }
+
+    // T30: Query audit log (CREATE IF NOT EXISTS — idempotent)
+    for statement in MIGRATION_005_SQL.split(';') {
         let trimmed = statement.trim();
         if !trimmed.is_empty() {
             let _ = sqlx::query(trimmed).execute(pool).await;

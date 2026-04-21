@@ -21,6 +21,29 @@ pub struct EnvVariable {
     pub created_at: String,
 }
 
+impl EnvVariable {
+    /// Return a masked copy for Tauri IPC — secret values replaced with empty string.
+    /// Frontend uses this for display; actual secret values are resolved only during execution.
+    pub fn to_masked(&self) -> EnvVariable {
+        EnvVariable {
+            value: if self.is_secret {
+                String::new()
+            } else {
+                self.value.clone()
+            },
+            ..self.clone()
+        }
+    }
+}
+
+pub async fn list_env_variables_masked(
+    pool: &SqlitePool,
+    environment_id: &str,
+) -> Result<Vec<EnvVariable>, String> {
+    let vars = list_env_variables(pool, environment_id).await?;
+    Ok(vars.into_iter().map(|v| v.to_masked()).collect())
+}
+
 fn row_to_environment(row: &sqlx::sqlite::SqliteRow) -> Environment {
     Environment {
         id: row.get("id"),
@@ -36,10 +59,10 @@ fn row_to_variable(row: &sqlx::sqlite::SqliteRow) -> EnvVariable {
     let db_value: String = row.get("value");
     let is_secret: bool = row.get::<i32, _>("is_secret") != 0;
 
-    // Resolve keychain sentinel if needed
+    // Resolve keychain sentinel if needed — return empty string on failure, never the sentinel
     let value = if is_secret && db_value == keychain::KEYCHAIN_SENTINEL {
         keychain::resolve_value(&db_value, &keychain::env_var_key(&environment_id, &key))
-            .unwrap_or(db_value)
+            .unwrap_or_else(|_| String::new())
     } else {
         db_value
     };
@@ -52,6 +75,15 @@ fn row_to_variable(row: &sqlx::sqlite::SqliteRow) -> EnvVariable {
         is_secret,
         created_at: row.get("created_at"),
     }
+}
+
+/// Get the ID of the currently active environment, if any.
+pub async fn get_active_environment_id(pool: &SqlitePool) -> Option<String> {
+    sqlx::query_scalar("SELECT id FROM environments WHERE is_active = 1")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
 }
 
 pub async fn list_environments(pool: &SqlitePool) -> Result<Vec<Environment>, String> {
@@ -126,10 +158,45 @@ pub async fn duplicate_environment(
     // Create new environment
     let new_env = create_environment(pool, new_name).await?;
 
-    // Copy variables
-    let vars = list_env_variables(pool, source_id).await?;
-    for var in vars {
-        set_env_variable(pool, &new_env.id, var.key, var.value, var.is_secret).await?;
+    // Copy variables — read raw rows to avoid resolving secrets to plaintext
+    let raw_rows = sqlx::query(
+        "SELECT key, value, is_secret FROM env_variables WHERE environment_id = ? ORDER BY key ASC",
+    )
+    .bind(source_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to list source variables: {e}"))?;
+
+    for row in &raw_rows {
+        let key: String = row.get("key");
+        let db_value: String = row.get("value");
+        let is_secret: bool = row.get::<i32, _>("is_secret") != 0;
+
+        if is_secret && db_value == keychain::KEYCHAIN_SENTINEL {
+            // Copy secret directly keychain-to-keychain without resolving to plaintext
+            let source_key = keychain::env_var_key(source_id, &key);
+            let dest_key = keychain::env_var_key(&new_env.id, &key);
+            let secret = keychain::get_secret(&source_key)
+                .map_err(|e| format!("Failed to read secret for {key}: {e}"))?
+                .ok_or_else(|| format!("Secret not found in keychain for {key}"))?;
+            keychain::store_secret(&dest_key, &secret)
+                .map_err(|e| format!("Failed to copy secret for {key}: {e}"))?;
+            // Insert with sentinel directly
+            let var_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO env_variables (id, environment_id, key, value, is_secret) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&var_id)
+            .bind(&new_env.id)
+            .bind(&key)
+            .bind(keychain::KEYCHAIN_SENTINEL)
+            .bind(1)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to copy variable {key}: {e}"))?;
+        } else {
+            set_env_variable(pool, &new_env.id, key, db_value, is_secret).await?;
+        }
     }
 
     Ok(new_env)
@@ -188,12 +255,11 @@ pub async fn set_env_variable(
         return Err("Variable key is required".to_string());
     }
 
-    // If secret, store in keychain and use sentinel in DB
+    // If secret, store in keychain and use sentinel in DB — fail on keychain error, no plaintext fallback
     let db_value = if is_secret && !value.is_empty() {
-        match keychain::store_secret(&keychain::env_var_key(environment_id, &key), &value) {
-            Ok(()) => keychain::KEYCHAIN_SENTINEL.to_string(),
-            Err(_) => value.clone(), // fallback to plaintext
-        }
+        keychain::store_secret(&keychain::env_var_key(environment_id, &key), &value)
+            .map_err(|e| format!("Failed to store secret securely: {e}"))?;
+        keychain::KEYCHAIN_SENTINEL.to_string()
     } else {
         value.clone()
     };

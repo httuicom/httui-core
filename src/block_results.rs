@@ -1,6 +1,24 @@
 use serde::Serialize;
+use sha2::{Sha256, Digest};
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
+
+/// Compute a block hash that includes content + environment + connection context.
+/// This ensures cache invalidation when environment or connection changes (T31),
+/// and moves hash computation server-side so frontend cannot spoof it (T35).
+pub fn compute_block_hash(
+    content: &str,
+    environment_id: Option<&str>,
+    connection_id: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hasher.update(b"|env:");
+    hasher.update(environment_id.unwrap_or("").as_bytes());
+    hasher.update(b"|conn:");
+    hasher.update(connection_id.unwrap_or("").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
 
 #[derive(Debug, Serialize)]
 pub struct CachedBlockResult {
@@ -62,6 +80,50 @@ pub async fn save_block_result(
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// T38: Try to acquire an execution lock for a block.
+/// Returns true if lock was acquired (caller should execute), false if another execution is in progress.
+pub async fn try_acquire_execution_lock(
+    pool: &SqlitePool,
+    file_path: &str,
+    block_hash: &str,
+) -> Result<bool, sqlx::Error> {
+    // Use a temp table row as a mutex. INSERT OR IGNORE returns rows_affected=0 if lock exists.
+    let result = sqlx::query(
+        "INSERT OR IGNORE INTO block_execution_locks (file_path, block_hash, locked_at)
+         VALUES (?1, ?2, datetime('now'))",
+    )
+    .bind(file_path)
+    .bind(block_hash)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// T38: Release an execution lock after block execution completes.
+pub async fn release_execution_lock(
+    pool: &SqlitePool,
+    file_path: &str,
+    block_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM block_execution_locks WHERE file_path = ?1 AND block_hash = ?2")
+        .bind(file_path)
+        .bind(block_hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// T38: Clean up stale execution locks (older than 60 seconds — execution timed out or crashed).
+pub async fn cleanup_stale_locks(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM block_execution_locks WHERE locked_at < datetime('now', '-60 seconds')",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

@@ -66,12 +66,18 @@ pub fn extract_alias(placeholder: &str) -> Option<&str> {
 
 /// Navigate a JSON value by a dot-separated path.
 /// `response.data.0.id` navigates into nested objects and arrays.
+/// Property names blocked for prototype pollution defense.
+const DANGEROUS_KEYS: &[&str] = &["__proto__", "constructor", "prototype"];
+
 pub fn navigate_json(value: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = value.clone();
     for part in parts {
         if part.is_empty() {
             continue;
+        }
+        if DANGEROUS_KEYS.contains(&part) {
+            return None;
         }
         if let Ok(idx) = part.parse::<usize>() {
             current = current.get(idx)?.clone();
