@@ -12,18 +12,15 @@ struct DbParams {
     query: String,
     #[serde(default)]
     bind_values: Vec<serde_json::Value>,
-    #[serde(default = "default_page")]
-    page: u32,
-    #[serde(default = "default_page_size")]
-    page_size: u32,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default = "default_fetch_size")]
+    fetch_size: u32,
     timeout_ms: Option<u64>,
 }
 
-fn default_page() -> u32 {
-    1
-}
-fn default_page_size() -> u32 {
-    100
+fn default_fetch_size() -> u32 {
+    80
 }
 
 pub struct DbExecutor {
@@ -52,11 +49,8 @@ impl Executor for DbExecutor {
         if p.query.trim().is_empty() {
             return Err("query is required".to_string());
         }
-        if p.page == 0 {
-            return Err("page must be >= 1".to_string());
-        }
-        if p.page_size == 0 {
-            return Err("page_size must be >= 1".to_string());
+        if p.fetch_size == 0 {
+            return Err("fetch_size must be >= 1".to_string());
         }
 
         Ok(())
@@ -79,13 +73,13 @@ impl Executor for DbExecutor {
             let timeout = std::time::Duration::from_millis(timeout_ms);
             tokio::time::timeout(
                 timeout,
-                pool.execute_query(&p.query, &p.bind_values, p.page, p.page_size),
+                pool.execute_query(&p.query, &p.bind_values, p.offset, p.fetch_size),
             )
             .await
             .map_err(|_| ExecutorError(format!("Query timed out after {}ms", timeout_ms)))?
             .map_err(ExecutorError)?
         } else {
-            pool.execute_query(&p.query, &p.bind_values, p.page, p.page_size)
+            pool.execute_query(&p.query, &p.bind_values, p.offset, p.fetch_size)
                 .await
                 .map_err(ExecutorError)?
         };
@@ -125,9 +119,7 @@ impl Executor for DbExecutor {
                 data: serde_json::json!({
                     "columns": columns,
                     "rows": rows,
-                    "total_rows": result.total_rows,
-                    "page": p.page,
-                    "page_size": p.page_size,
+                    "has_more": result.has_more,
                 }),
                 duration_ms,
             })
@@ -263,7 +255,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, "success");
-        assert_eq!(result.data["total_rows"], 2);
+        assert_eq!(result.data["has_more"], false);
         assert_eq!(result.data["rows"].as_array().unwrap().len(), 2);
         assert_eq!(result.data["columns"].as_array().unwrap().len(), 2);
     }
@@ -328,11 +320,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, "success");
-        assert_eq!(result.data["total_rows"], 2);
+        assert_eq!(result.data["has_more"], false);
+        assert_eq!(result.data["rows"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn test_db_executor_pagination() {
+    async fn test_db_executor_progressive_fetch() {
         let (manager, conn_id) = setup_test_env().await;
 
         let pool = manager.get_pool(&conn_id).await.unwrap();
@@ -355,46 +348,60 @@ mod tests {
 
         let executor = DbExecutor::new(manager);
 
-        // Page 1, size 5
+        // First fetch: offset=0, fetch_size=5 → 5 rows, has_more=true
         let result = executor
             .execute(serde_json::json!({
                 "connection_id": conn_id,
                 "query": "SELECT * FROM nums",
-                "page": 1,
-                "page_size": 5,
+                "offset": 0,
+                "fetch_size": 5,
             }))
             .await
             .unwrap();
 
-        assert_eq!(result.data["total_rows"], 15);
-        assert_eq!(result.data["rows"].as_array().unwrap().len(), 5);
-        assert_eq!(result.data["page"], 1);
-        assert_eq!(result.data["page_size"], 5);
-
-        // Page 3, size 5 (should have 5 rows)
-        let result = executor
-            .execute(serde_json::json!({
-                "connection_id": conn_id,
-                "query": "SELECT * FROM nums",
-                "page": 3,
-                "page_size": 5,
-            }))
-            .await
-            .unwrap();
-
+        assert_eq!(result.data["has_more"], true);
         assert_eq!(result.data["rows"].as_array().unwrap().len(), 5);
 
-        // Page 4, size 5 (should have 0 rows)
+        // Second fetch: offset=5, fetch_size=5 → 5 rows, has_more=true
         let result = executor
             .execute(serde_json::json!({
                 "connection_id": conn_id,
                 "query": "SELECT * FROM nums",
-                "page": 4,
-                "page_size": 5,
+                "offset": 5,
+                "fetch_size": 5,
             }))
             .await
             .unwrap();
 
+        assert_eq!(result.data["has_more"], true);
+        assert_eq!(result.data["rows"].as_array().unwrap().len(), 5);
+
+        // Third fetch: offset=10, fetch_size=5 → 5 rows, has_more=false
+        let result = executor
+            .execute(serde_json::json!({
+                "connection_id": conn_id,
+                "query": "SELECT * FROM nums",
+                "offset": 10,
+                "fetch_size": 5,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.data["has_more"], false);
+        assert_eq!(result.data["rows"].as_array().unwrap().len(), 5);
+
+        // Fourth fetch: offset=15, fetch_size=5 → 0 rows, has_more=false
+        let result = executor
+            .execute(serde_json::json!({
+                "connection_id": conn_id,
+                "query": "SELECT * FROM nums",
+                "offset": 15,
+                "fetch_size": 5,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.data["has_more"], false);
         assert_eq!(result.data["rows"].as_array().unwrap().len(), 0);
     }
 }

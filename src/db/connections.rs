@@ -609,7 +609,7 @@ pub type JsonRow = Vec<serde_json::Value>;
 pub struct QueryResult {
     pub columns: Vec<ColumnInfo>,
     pub rows: Vec<JsonRow>,
-    pub total_rows: Option<i64>,
+    pub has_more: bool,
     pub rows_affected: Option<u64>,
     pub is_select: bool,
 }
@@ -633,8 +633,8 @@ impl DatabasePool {
         &self,
         sql: &str,
         bind_values: &[serde_json::Value],
-        page: u32,
-        page_size: u32,
+        offset: u32,
+        fetch_size: u32,
     ) -> Result<QueryResult, String> {
         let trimmed = sql.trim_start().to_uppercase();
         let is_select = trimmed.starts_with("SELECT")
@@ -645,7 +645,7 @@ impl DatabasePool {
             || trimmed.starts_with("PRAGMA");
 
         if is_select {
-            self.execute_select(sql, bind_values, page, page_size).await
+            self.execute_select(sql, bind_values, offset, fetch_size).await
         } else {
             self.execute_mutation(sql, bind_values).await
         }
@@ -655,18 +655,18 @@ impl DatabasePool {
         &self,
         sql: &str,
         bind_values: &[serde_json::Value],
-        page: u32,
-        page_size: u32,
+        offset: u32,
+        fetch_size: u32,
     ) -> Result<QueryResult, String> {
         match self {
             Self::Sqlite(pool) => {
-                execute_select_sqlite(pool, sql, bind_values, page, page_size).await
+                execute_select_sqlite(pool, sql, bind_values, offset, fetch_size).await
             }
             Self::Postgres(pool) => {
-                execute_select_pg(pool, sql, bind_values, page, page_size).await
+                execute_select_pg(pool, sql, bind_values, offset, fetch_size).await
             }
             Self::MySql(pool) => {
-                execute_select_mysql(pool, sql, bind_values, page, page_size).await
+                execute_select_mysql(pool, sql, bind_values, offset, fetch_size).await
             }
         }
     }
@@ -690,35 +690,28 @@ async fn execute_select_sqlite(
     pool: &sqlx::SqlitePool,
     sql: &str,
     bind_values: &[serde_json::Value],
-    page: u32,
-    page_size: u32,
+    offset: u32,
+    fetch_size: u32,
 ) -> Result<QueryResult, String> {
-    // Count total rows
-    let count_sql = format!("SELECT COUNT(*) as cnt FROM ({sql})");
-    let mut count_query = sqlx::query(&count_sql);
-    for val in bind_values {
-        count_query = bind_sqlite_value(count_query, val);
-    }
-    let count_row = count_query
-        .fetch_one(pool)
-        .await
-        .map_err(|e| format!("Count query failed: {e}"))?;
-    let total_rows: i64 = count_row.get("cnt");
-
-    // Paginated query
-    let offset = ((page - 1) * page_size) as i64;
-    let limit = page_size as i64;
-    let paginated_sql = format!("SELECT * FROM ({sql}) LIMIT {limit} OFFSET {offset}");
+    // Fetch one extra row to detect has_more
+    let limit = (fetch_size + 1) as i64;
+    let off = offset as i64;
+    let paginated_sql = format!("SELECT * FROM ({sql}) LIMIT {limit} OFFSET {off}");
 
     let mut query = sqlx::query(&paginated_sql);
     for val in bind_values {
         query = bind_sqlite_value(query, val);
     }
 
-    let rows = query
+    let mut rows = query
         .fetch_all(pool)
         .await
         .map_err(|e| format!("Query failed: {e}"))?;
+
+    let has_more = rows.len() > fetch_size as usize;
+    if has_more {
+        rows.pop(); // Remove the extra probe row
+    }
 
     let columns: Vec<ColumnInfo> = if let Some(first) = rows.first() {
         first
@@ -741,7 +734,7 @@ async fn execute_select_sqlite(
     Ok(QueryResult {
         columns,
         rows: json_rows,
-        total_rows: Some(total_rows),
+        has_more,
         rows_affected: None,
         is_select: true,
     })
@@ -765,7 +758,7 @@ async fn execute_mutation_sqlite(
     Ok(QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
-        total_rows: None,
+        has_more: false,
         rows_affected: Some(result.rows_affected()),
         is_select: false,
     })
@@ -819,28 +812,15 @@ async fn execute_select_pg(
     pool: &sqlx::PgPool,
     sql: &str,
     bind_values: &[serde_json::Value],
-    page: u32,
-    page_size: u32,
+    offset: u32,
+    fetch_size: u32,
 ) -> Result<QueryResult, String> {
     let pg_sql = normalize_placeholders_to_pg(sql);
 
-    // Count
-    let count_sql = format!("SELECT COUNT(*) as cnt FROM ({pg_sql}) AS _c");
-    let mut count_query = sqlx::query(&count_sql);
-    for val in bind_values {
-        count_query = bind_pg_value(count_query, val);
-    }
-    let count_row = count_query
-        .fetch_one(pool)
-        .await
-        .map_err(|e| format!("Count query failed: {e}"))?;
-    let total_rows: i64 = count_row.get("cnt");
-
-    // Paginated
-    let offset = ((page - 1) * page_size) as i64;
-    let limit = page_size as i64;
+    let limit = (fetch_size + 1) as i64;
+    let off = offset as i64;
     let paginated_sql = format!(
-        "SELECT * FROM ({pg_sql}) AS _p LIMIT {limit} OFFSET {offset}"
+        "SELECT * FROM ({pg_sql}) AS _p LIMIT {limit} OFFSET {off}"
     );
 
     let mut query = sqlx::query(&paginated_sql);
@@ -848,10 +828,15 @@ async fn execute_select_pg(
         query = bind_pg_value(query, val);
     }
 
-    let rows = query
+    let mut rows = query
         .fetch_all(pool)
         .await
         .map_err(|e| format!("Query failed: {e}"))?;
+
+    let has_more = rows.len() > fetch_size as usize;
+    if has_more {
+        rows.pop();
+    }
 
     let columns: Vec<ColumnInfo> = if let Some(first) = rows.first() {
         first
@@ -871,7 +856,7 @@ async fn execute_select_pg(
     Ok(QueryResult {
         columns,
         rows: json_rows,
-        total_rows: Some(total_rows),
+        has_more,
         rows_affected: None,
         is_select: true,
     })
@@ -896,7 +881,7 @@ async fn execute_mutation_pg(
     Ok(QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
-        total_rows: None,
+        has_more: false,
         rows_affected: Some(result.rows_affected()),
         is_select: false,
     })
@@ -951,36 +936,28 @@ async fn execute_select_mysql(
     pool: &sqlx::MySqlPool,
     sql: &str,
     bind_values: &[serde_json::Value],
-    page: u32,
-    page_size: u32,
+    offset: u32,
+    fetch_size: u32,
 ) -> Result<QueryResult, String> {
-    // Count
-    let count_sql = format!("SELECT COUNT(*) as cnt FROM ({sql}) AS _c");
-    let mut count_query = sqlx::query(&count_sql);
-    for val in bind_values {
-        count_query = bind_mysql_value(count_query, val);
-    }
-    let count_row = count_query
-        .fetch_one(pool)
-        .await
-        .map_err(|e| format!("Count query failed: {e}"))?;
-    let total_rows: i64 = count_row.get("cnt");
-
-    // Paginated
-    let offset = ((page - 1) * page_size) as i64;
-    let limit = page_size as i64;
+    let limit = (fetch_size + 1) as i64;
+    let off = offset as i64;
     let paginated_sql =
-        format!("SELECT * FROM ({sql}) AS _p LIMIT {limit} OFFSET {offset}");
+        format!("SELECT * FROM ({sql}) AS _p LIMIT {limit} OFFSET {off}");
 
     let mut query = sqlx::query(&paginated_sql);
     for val in bind_values {
         query = bind_mysql_value(query, val);
     }
 
-    let rows = query
+    let mut rows = query
         .fetch_all(pool)
         .await
         .map_err(|e| format!("Query failed: {e}"))?;
+
+    let has_more = rows.len() > fetch_size as usize;
+    if has_more {
+        rows.pop();
+    }
 
     let columns: Vec<ColumnInfo> = if let Some(first) = rows.first() {
         first
@@ -1000,7 +977,7 @@ async fn execute_select_mysql(
     Ok(QueryResult {
         columns,
         rows: json_rows,
-        total_rows: Some(total_rows),
+        has_more,
         rows_affected: None,
         is_select: true,
     })
@@ -1024,7 +1001,7 @@ async fn execute_mutation_mysql(
     Ok(QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
-        total_rows: None,
+        has_more: false,
         rows_affected: Some(result.rows_affected()),
         is_select: false,
     })
@@ -1361,12 +1338,12 @@ mod tests {
 
         let db_pool = DatabasePool::Sqlite(pool);
         let result = db_pool
-            .execute_query("SELECT * FROM test_table", &[], 1, 100)
+            .execute_query("SELECT * FROM test_table", &[], 0, 100)
             .await
             .unwrap();
 
         assert!(result.is_select);
-        assert_eq!(result.total_rows, Some(3));
+        assert_eq!(result.has_more, false);
         assert_eq!(result.rows.len(), 3);
         assert_eq!(result.columns.len(), 3);
         assert_eq!(result.columns[0].name, "id");
@@ -1392,19 +1369,20 @@ mod tests {
 
         let db_pool = DatabasePool::Sqlite(pool);
 
-        // Page 1, size 3
+        // offset=0, fetch_size=3 → 3 rows, has_more=true
         let result = db_pool
-            .execute_query("SELECT * FROM items", &[], 1, 3)
+            .execute_query("SELECT * FROM items", &[], 0, 3)
             .await
             .unwrap();
-        assert_eq!(result.total_rows, Some(10));
+        assert_eq!(result.has_more, true);
         assert_eq!(result.rows.len(), 3);
 
-        // Page 4, size 3 (should have 1 row)
+        // offset=9, fetch_size=3 → 1 row, has_more=false
         let result = db_pool
-            .execute_query("SELECT * FROM items", &[], 4, 3)
+            .execute_query("SELECT * FROM items", &[], 9, 3)
             .await
             .unwrap();
+        assert_eq!(result.has_more, false);
         assert_eq!(result.rows.len(), 1);
     }
 
@@ -1451,7 +1429,7 @@ mod tests {
             .execute_query(
                 "SELECT * FROM users WHERE active = ? AND name != ?",
                 &[serde_json::json!(1), serde_json::json!("alice")],
-                1,
+                0,
                 100,
             )
             .await
