@@ -1,3 +1,4 @@
+use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
 use sqlx::{Column, Row, TypeInfo};
@@ -1238,28 +1239,136 @@ fn bind_mysql_value<'q>(
 fn mysql_row_to_json(row: &sqlx::mysql::MySqlRow) -> JsonRow {
     row.columns()
         .iter()
-        .map(|col| {
-            let idx = col.ordinal();
-            if let Ok(v) = row.try_get::<i64, _>(idx) {
-                serde_json::Value::Number(v.into())
-            } else if let Ok(v) = row.try_get::<i32, _>(idx) {
-                serde_json::Value::Number(v.into())
-            } else if let Ok(v) = row.try_get::<f64, _>(idx) {
-                serde_json::json!(v)
-            } else if let Ok(v) = row.try_get::<bool, _>(idx) {
-                serde_json::Value::Bool(v)
-            } else if let Ok(v) = row.try_get::<String, _>(idx) {
-                serde_json::Value::String(v)
-            } else if let Ok(v) = row.try_get::<Vec<u8>, _>(idx) {
-                // Fallback for VARBINARY/BLOB (e.g. ProxySQL returns VARCHAR
-                // columns as VARBINARY). Lossy UTF-8 conversion preserves text
-                // content; genuine binary blobs will show replacement chars.
-                serde_json::Value::String(String::from_utf8_lossy(&v).into_owned())
-            } else {
-                serde_json::Value::Null
-            }
-        })
+        .map(|col| mysql_value_to_json(row, col))
         .collect()
+}
+
+// Dispatch by column type name rather than a fallthrough chain of `try_get`.
+// sqlx-mysql rejects `i64` for any UNSIGNED column and rejects `String` for
+// `JSON` columns, so the old chain silently decoded BIGINT UNSIGNED as `bool`
+// and JSON as raw wire bytes (9-byte length prefix + payload).
+fn mysql_value_to_json(
+    row: &sqlx::mysql::MySqlRow,
+    col: &sqlx::mysql::MySqlColumn,
+) -> serde_json::Value {
+    use sqlx::ValueRef;
+    let idx = col.ordinal();
+
+    // Separate a real NULL from a decode failure. Without this distinction,
+    // any type sqlx can't decode with the preferred Rust type would silently
+    // collapse to JSON null.
+    if let Ok(raw) = <sqlx::mysql::MySqlRow as sqlx::Row>::try_get_raw(row, idx) {
+        if raw.is_null() {
+            return serde_json::Value::Null;
+        }
+    }
+
+    let ty = col.type_info().name();
+
+    // Preferred per-type decoding; returns None if sqlx can't decode that type.
+    // When it returns None, the fallback chain kicks in so the user still sees
+    // something instead of null.
+    decode_mysql_by_type(row, idx, ty).unwrap_or_else(|| mysql_fallback_decode(row, idx, ty))
+}
+
+fn decode_mysql_by_type(
+    row: &sqlx::mysql::MySqlRow,
+    idx: usize,
+    ty: &str,
+) -> Option<serde_json::Value> {
+    Some(match ty {
+        // sqlx-mysql reports TINYINT(1) as "BOOLEAN" (see ColumnType::name).
+        // `i64::compatible` rejects it, so it has to go through `bool`.
+        "BOOLEAN" => serde_json::Value::Bool(mysql_get::<bool>(row, idx)?),
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => {
+            serde_json::Value::Number(mysql_get::<i64>(row, idx)?.into())
+        }
+        "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" => {
+            serde_json::Value::Number(mysql_get::<u32>(row, idx)?.into())
+        }
+        "BIGINT UNSIGNED" => serde_json::Value::Number(mysql_get::<u64>(row, idx)?.into()),
+        "FLOAT" | "DOUBLE" => serde_json::json!(mysql_get::<f64>(row, idx)?),
+        // DECIMAL: stringified to preserve precision without pulling in
+        // `bigdecimal`/`rust_decimal` features.
+        "DECIMAL" => serde_json::Value::String(mysql_get::<String>(row, idx)?),
+        "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM" | "SET" => {
+            serde_json::Value::String(mysql_get::<String>(row, idx)?)
+        }
+        // JSON: must go through `sqlx::types::Json` (requires `json` feature).
+        // Decoding as `String` or `Vec<u8>` yields wire-format garbage.
+        "JSON" => {
+            let sqlx::types::Json(v) = row
+                .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>(idx)
+                .ok()
+                .flatten()?;
+            v
+        }
+        // Temporal types arrive as binary tuples over the MySQL binary protocol
+        // (prepared statements), so `String` decoding fails. Go through chrono.
+        "DATETIME" => serde_json::Value::String(
+            mysql_get::<sqlx::types::chrono::NaiveDateTime>(row, idx)?
+                .format("%Y-%m-%d %H:%M:%S%.f")
+                .to_string(),
+        ),
+        "TIMESTAMP" => serde_json::Value::String(
+            mysql_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>>(row, idx)?
+                .to_rfc3339(),
+        ),
+        "DATE" => serde_json::Value::String(
+            mysql_get::<sqlx::types::chrono::NaiveDate>(row, idx)?.to_string(),
+        ),
+        "TIME" => serde_json::Value::String(
+            mysql_get::<sqlx::types::chrono::NaiveTime>(row, idx)?
+                .format("%H:%M:%S%.f")
+                .to_string(),
+        ),
+        "YEAR" => {
+            if let Some(v) = mysql_get::<u16>(row, idx) {
+                serde_json::Value::Number(v.into())
+            } else {
+                serde_json::Value::Number(mysql_get::<i64>(row, idx)?.into())
+            }
+        }
+        "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" | "VARBINARY" | "GEOMETRY"
+        | "BIT" => serde_json::Value::String(BASE64_STANDARD.encode(mysql_get::<Vec<u8>>(row, idx)?)),
+        "NULL" => serde_json::Value::Null,
+        _ => return None,
+    })
+}
+
+// Fallback decoder invoked when the preferred decode for a known type fails
+// or when a future/unmapped type name is encountered. At this point NULL has
+// already been ruled out by the caller, so we try the two most permissive
+// sqlx decoders and, as a last resort, emit a tagged marker so the user knows
+// a value exists but couldn't be interpreted.
+fn mysql_fallback_decode(
+    row: &sqlx::mysql::MySqlRow,
+    idx: usize,
+    ty: &str,
+) -> serde_json::Value {
+    if let Some(s) = mysql_get::<String>(row, idx) {
+        return serde_json::Value::String(s);
+    }
+    if let Some(bytes) = mysql_get::<Vec<u8>>(row, idx) {
+        return match std::str::from_utf8(&bytes) {
+            Ok(s) => serde_json::Value::String(s.to_string()),
+            Err(_) => serde_json::Value::String(format!(
+                "base64:{}",
+                BASE64_STANDARD.encode(&bytes)
+            )),
+        };
+    }
+    serde_json::Value::String(format!("<unable to decode {}>", ty))
+}
+
+// Flattens `Result<Option<T>>` from sqlx into `Option<T>`. Safe to treat both
+// NULL and decode errors as `None` here because the caller already handled
+// real NULLs via `try_get_raw`.
+fn mysql_get<T>(row: &sqlx::mysql::MySqlRow, idx: usize) -> Option<T>
+where
+    T: for<'r> sqlx::Decode<'r, sqlx::MySql> + sqlx::Type<sqlx::MySql>,
+{
+    row.try_get::<Option<T>, _>(idx).ok().flatten()
 }
 
 // --- Bind parameter validation (T13, T22, T23) ---
