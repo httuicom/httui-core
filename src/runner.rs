@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::db::connections::PoolManager;
 use crate::db::environments;
 use crate::executor::{BlockRequest, BlockResult, ExecutorRegistry};
 use crate::parser::{self, ParsedBlock};
@@ -39,20 +38,11 @@ impl std::error::Error for RunnerError {}
 pub struct BlockRunner {
     registry: Arc<ExecutorRegistry>,
     pool: sqlx::sqlite::SqlitePool,
-    conn_manager: Arc<PoolManager>,
 }
 
 impl BlockRunner {
-    pub fn new(
-        registry: Arc<ExecutorRegistry>,
-        pool: sqlx::sqlite::SqlitePool,
-        conn_manager: Arc<PoolManager>,
-    ) -> Self {
-        Self {
-            registry,
-            pool,
-            conn_manager,
-        }
+    pub fn new(registry: Arc<ExecutorRegistry>, pool: sqlx::sqlite::SqlitePool) -> Self {
+        Self { registry, pool }
     }
 
     /// Execute a block by alias from a note file.
@@ -226,12 +216,11 @@ mod tests {
     async fn setup() -> (TempDir, BlockRunner, String) {
         let tmp = TempDir::new().unwrap();
         let pool = db::init_db(tmp.path()).await.unwrap();
-        let conn_manager = Arc::new(PoolManager::new_standalone(pool.clone()));
 
         let mut registry = ExecutorRegistry::new();
         registry.register(Box::new(HttpExecutor::new()));
 
-        let runner = BlockRunner::new(Arc::new(registry), pool, conn_manager);
+        let runner = BlockRunner::new(Arc::new(registry), pool);
 
         // Create vault dir
         let vault_dir = tmp.path().join("vault");
