@@ -17,6 +17,9 @@ const MIGRATION_002_SQL: &str = include_str!("../../migrations/002_env_is_secret
 const MIGRATION_003_SQL: &str = include_str!("../../migrations/003_chat.sql");
 const MIGRATION_004_SQL: &str = include_str!("../../migrations/004_permissions.sql");
 const MIGRATION_005_SQL: &str = include_str!("../../migrations/005_audit_log.sql");
+const MIGRATION_006_SQL: &str = include_str!("../../migrations/006_schema_cache_schema_name.sql");
+const MIGRATION_007_SQL: &str = include_str!("../../migrations/007_connection_readonly.sql");
+const MIGRATION_008_SQL: &str = include_str!("../../migrations/008_sqlite_port_null.sql");
 
 pub async fn init_db(app_data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
     std::fs::create_dir_all(app_data_dir).ok();
@@ -159,6 +162,30 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     // T30: Query audit log (CREATE IF NOT EXISTS — idempotent)
     for statement in MIGRATION_005_SQL.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            let _ = sqlx::query(trimmed).execute(pool).await;
+        }
+    }
+
+    // Stage 7: schema_cache.schema_name (ALTER may fail if column exists — ok)
+    for statement in MIGRATION_006_SQL.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            let _ = sqlx::query(trimmed).execute(pool).await;
+        }
+    }
+
+    // Stage 8: connections.is_readonly (ALTER may fail if column exists — ok)
+    for statement in MIGRATION_007_SQL.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            let _ = sqlx::query(trimmed).execute(pool).await;
+        }
+    }
+
+    // Stage 8: heal SQLite connections that had port coerced to 0 (idempotent)
+    for statement in MIGRATION_008_SQL.split(';') {
         let trimmed = statement.trim();
         if !trimmed.is_empty() {
             let _ = sqlx::query(trimmed).execute(pool).await;

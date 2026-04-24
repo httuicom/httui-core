@@ -66,6 +66,7 @@ pub struct Connection {
     pub query_timeout_ms: i64,
     pub ttl_seconds: i64,
     pub max_pool_size: i64,
+    pub is_readonly: bool,
     pub last_tested_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -87,6 +88,7 @@ pub struct ConnectionPublic {
     pub query_timeout_ms: i64,
     pub ttl_seconds: i64,
     pub max_pool_size: i64,
+    pub is_readonly: bool,
     pub last_tested_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -108,6 +110,7 @@ impl Connection {
             query_timeout_ms: self.query_timeout_ms,
             ttl_seconds: self.ttl_seconds,
             max_pool_size: self.max_pool_size,
+            is_readonly: self.is_readonly,
             last_tested_at: self.last_tested_at.clone(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
@@ -134,6 +137,7 @@ pub struct CreateConnection {
     pub query_timeout_ms: Option<i64>,
     pub ttl_seconds: Option<i64>,
     pub max_pool_size: Option<i64>,
+    pub is_readonly: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +154,7 @@ pub struct UpdateConnection {
     pub query_timeout_ms: Option<i64>,
     pub ttl_seconds: Option<i64>,
     pub max_pool_size: Option<i64>,
+    pub is_readonly: Option<bool>,
 }
 
 // --- ConnectionManager ---
@@ -427,9 +432,14 @@ fn validate_pool_config(conn: &Connection) -> Result<(), String> {
             conn.query_timeout_ms
         ));
     }
-    if let Some(port) = conn.port {
-        if port < 1 || port > 65535 {
-            return Err(format!("port must be between 1 and 65535, got {port}"));
+    // SQLite connections have no TCP port; skip the range check entirely
+    // (older records may have been persisted with `port = 0` by an earlier
+    // bug in `update_connection`, and we don't want them stuck unusable).
+    if conn.driver != "sqlite" {
+        if let Some(port) = conn.port {
+            if !(1..=65535).contains(&port) {
+                return Err(format!("port must be between 1 and 65535, got {port}"));
+            }
         }
     }
     if conn.ttl_seconds < 10 || conn.ttl_seconds > 86400 {
@@ -455,11 +465,134 @@ fn sanitize_connection_error(driver: &str, e: sqlx::Error) -> String {
 
 /// Sanitize query errors — expose database error messages (safe) but strip connection details.
 pub(crate) fn sanitize_query_error(e: sqlx::Error) -> String {
-    match &e {
+    sanitize_query_error_rich(&e).message
+}
+
+/// Cursor location inside the source SQL where the error was reported.
+/// Populated from driver-specific metadata (Postgres `position`, MySQL
+/// `near … at line N`); `None` when the driver didn't expose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueryErrorLocation {
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryErrorInfo {
+    pub message: String,
+    pub location: QueryErrorLocation,
+}
+
+impl std::fmt::Display for QueryErrorInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<QueryErrorInfo> for String {
+    fn from(value: QueryErrorInfo) -> String {
+        value.message
+    }
+}
+
+impl QueryErrorInfo {
+    /// Convenience proxy so existing `.contains(...)` assertions in tests
+    /// keep reading naturally without being forced onto `.message.contains(...)`.
+    pub fn contains(&self, needle: &str) -> bool {
+        self.message.contains(needle)
+    }
+}
+
+/// Sanitize a sqlx error AND pull out line/column when the driver exposes
+/// them. The string message is the same as `sanitize_query_error` so the
+/// existing "Query failed: …" prefix is preserved.
+pub fn sanitize_query_error_rich(e: &sqlx::Error) -> QueryErrorInfo {
+    match e {
         sqlx::Error::Database(db_err) => {
-            format!("Query failed: {}", db_err.message())
+            let msg = format!("Query failed: {}", db_err.message());
+            let location = extract_error_location(db_err.as_ref());
+            QueryErrorInfo { message: msg, location }
         }
-        _ => "Query failed".to_string(),
+        _ => QueryErrorInfo {
+            message: "Query failed".to_string(),
+            location: QueryErrorLocation::default(),
+        },
+    }
+}
+
+/// Turn a Postgres 1-indexed char position into (line, column). Returns
+/// `(1, 1)` if the position overruns the query (shouldn't happen in
+/// practice).
+fn position_to_line_col(query: &str, position: u32) -> (u32, u32) {
+    if position == 0 {
+        return (1, 1);
+    }
+    let target = (position as usize).saturating_sub(1);
+    let mut line = 1u32;
+    let mut col = 1u32;
+    for (idx, ch) in query.char_indices() {
+        if idx >= target {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+fn extract_error_location(db_err: &dyn sqlx::error::DatabaseError) -> QueryErrorLocation {
+    // Postgres: downcast to access the PgErrorPosition helper. The position
+    // is an offset into the original query string (1-indexed). Callers
+    // know the query and convert to line/col via `enrich_error_with_query`.
+    if let Some(pg) = db_err.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+        if let Some(pos) = pg.position() {
+            if let sqlx::postgres::PgErrorPosition::Original(p) = pos {
+                // Stash position as raw column for now; caller converts
+                // once it has the query text.
+                return QueryErrorLocation {
+                    line: None,
+                    column: Some(p as u32),
+                };
+            }
+        }
+    }
+    // MySQL: message often contains "near '…' at line N".
+    let msg = db_err.message();
+    if let Some(line) = mysql_line_from_message(msg) {
+        return QueryErrorLocation {
+            line: Some(line),
+            column: None,
+        };
+    }
+    QueryErrorLocation::default()
+}
+
+fn mysql_line_from_message(msg: &str) -> Option<u32> {
+    // Example: "You have an error in your SQL syntax; ... at line 3".
+    let lower = msg.to_ascii_lowercase();
+    let idx = lower.find(" at line ")?;
+    let tail = &msg[idx + " at line ".len()..];
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// After capture, resolve Postgres-style raw byte position into (line, col)
+/// using the query text the executor sent. MySQL line (already extracted
+/// from the message) passes through unchanged.
+pub fn enrich_error_with_query(
+    info: &mut QueryErrorInfo,
+    query: &str,
+) {
+    if info.location.line.is_none() {
+        if let Some(pos) = info.location.column {
+            let (l, c) = position_to_line_col(query, pos);
+            info.location.line = Some(l);
+            info.location.column = Some(c);
+        }
     }
 }
 
@@ -542,6 +675,8 @@ fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
         query_timeout_ms: row.get("query_timeout_ms"),
         ttl_seconds: row.get("ttl_seconds"),
         max_pool_size: row.get("max_pool_size"),
+        // is_readonly stored as INTEGER (0/1) in SQLite
+        is_readonly: row.try_get::<i64, _>("is_readonly").map(|v| v != 0).unwrap_or(false),
         last_tested_at: row.get("last_tested_at"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -555,6 +690,7 @@ pub async fn list_connections(pool: &SqlitePool) -> Result<Vec<Connection>, Stri
         r#"SELECT
             id, name, driver, host, port, database_name, username, password,
             ssl_mode, timeout_ms, query_timeout_ms, ttl_seconds, max_pool_size,
+            is_readonly,
             last_tested_at, created_at, updated_at
         FROM connections
         ORDER BY name"#,
@@ -574,6 +710,7 @@ pub async fn get_connection(
         r#"SELECT
             id, name, driver, host, port, database_name, username, password,
             ssl_mode, timeout_ms, query_timeout_ms, ttl_seconds, max_pool_size,
+            is_readonly,
             last_tested_at, created_at, updated_at
         FROM connections WHERE id = ?"#,
     )
@@ -612,11 +749,14 @@ pub async fn create_connection(
         None
     };
 
+    let is_readonly = input.is_readonly.unwrap_or(false);
+
     sqlx::query(
         r#"INSERT INTO connections
             (id, name, driver, host, port, database_name, username, password,
-             ssl_mode, timeout_ms, query_timeout_ms, ttl_seconds, max_pool_size)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+             ssl_mode, timeout_ms, query_timeout_ms, ttl_seconds, max_pool_size,
+             is_readonly)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(&id)
     .bind(&input.name)
@@ -631,6 +771,7 @@ pub async fn create_connection(
     .bind(query_timeout_ms)
     .bind(ttl_seconds)
     .bind(max_pool_size)
+    .bind(if is_readonly { 1i64 } else { 0i64 })
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -651,18 +792,13 @@ pub async fn update_connection(
 
     let name = input.name.unwrap_or(existing.name);
     let driver = input.driver.unwrap_or(existing.driver);
-    let host = Some(input.host.unwrap_or_else(|| existing.host.unwrap_or_default()));
-    let port = Some(input.port.unwrap_or_else(|| existing.port.unwrap_or(0)));
-    let database_name = Some(
-        input
-            .database_name
-            .unwrap_or_else(|| existing.database_name.unwrap_or_default()),
-    );
-    let username = Some(
-        input
-            .username
-            .unwrap_or_else(|| existing.username.unwrap_or_default()),
-    );
+    // Preserve NULLs across partial updates: SQLite has no host/port, so
+    // forcing `Some(existing.port.unwrap_or(0))` would fail validation on
+    // every partial-field update (like the drawer's read-only toggle).
+    let host = input.host.or(existing.host);
+    let port = input.port.or(existing.port);
+    let database_name = input.database_name.or(existing.database_name);
+    let username = input.username.or(existing.username);
     // If a new password is provided, store in keychain — fail on error, no plaintext fallback
     let password = if let Some(ref new_pw) = input.password {
         if !new_pw.is_empty() {
@@ -685,6 +821,7 @@ pub async fn update_connection(
     let query_timeout_ms = input.query_timeout_ms.unwrap_or(existing.query_timeout_ms);
     let ttl_seconds = input.ttl_seconds.unwrap_or(existing.ttl_seconds);
     let max_pool_size = input.max_pool_size.unwrap_or(existing.max_pool_size);
+    let is_readonly = input.is_readonly.unwrap_or(existing.is_readonly);
 
     validate_connection_fields(&driver, &host, &port, &database_name)?;
 
@@ -693,6 +830,7 @@ pub async fn update_connection(
             name = ?, driver = ?, host = ?, port = ?, database_name = ?,
             username = ?, password = ?, ssl_mode = ?, timeout_ms = ?,
             query_timeout_ms = ?, ttl_seconds = ?, max_pool_size = ?,
+            is_readonly = ?,
             updated_at = datetime('now')
         WHERE id = ?"#,
     )
@@ -708,6 +846,7 @@ pub async fn update_connection(
     .bind(query_timeout_ms)
     .bind(ttl_seconds)
     .bind(max_pool_size)
+    .bind(if is_readonly { 1i64 } else { 0i64 })
     .bind(id)
     .execute(pool)
     .await
@@ -780,9 +919,12 @@ pub struct QueryResult {
     pub is_select: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnInfo {
     pub name: String,
+    /// Driver-reported type name (e.g. "INTEGER", "int4"). Renamed on the
+    /// wire to `type` so TS consumers can write `col.type` ergonomically.
+    #[serde(rename = "type")]
     pub type_name: String,
 }
 
@@ -801,22 +943,30 @@ impl DatabasePool {
         bind_values: &[serde_json::Value],
         offset: u32,
         fetch_size: u32,
-    ) -> Result<QueryResult, String> {
+    ) -> Result<QueryResult, QueryErrorInfo> {
+        // Pre-send validations: not driver errors, so no line/col location.
+        let plain_err = |msg: String| QueryErrorInfo {
+            message: msg,
+            location: QueryErrorLocation::default(),
+        };
+
         // T08: Reject multi-statement queries
         if contains_multiple_statements(sql) {
-            return Err("Multi-statement queries are not allowed".to_string());
+            return Err(plain_err(
+                "Multi-statement queries are not allowed".to_string(),
+            ));
         }
 
         // T23/T13: Reject non-primitive or out-of-range bind values
-        validate_bind_values(bind_values)?;
+        validate_bind_values(bind_values).map_err(plain_err)?;
 
         // T22: Validate bind count matches placeholder count
         let expected = count_placeholders(sql);
         if bind_values.len() != expected {
-            return Err(format!(
+            return Err(plain_err(format!(
                 "Bind values count ({}) does not match placeholder count ({expected})",
                 bind_values.len()
-            ));
+            )));
         }
 
         let trimmed = sql.trim_start().to_uppercase();
@@ -837,9 +987,9 @@ impl DatabasePool {
                     .iter()
                     .any(|kw| after_explain.starts_with(kw))
                 {
-                    return Err(
+                    return Err(plain_err(
                         "EXPLAIN ANALYZE with mutation statements is not allowed".to_string(),
-                    );
+                    ));
                 }
             }
         }
@@ -868,7 +1018,7 @@ impl DatabasePool {
         bind_values: &[serde_json::Value],
         offset: u32,
         fetch_size: u32,
-    ) -> Result<QueryResult, String> {
+    ) -> Result<QueryResult, QueryErrorInfo> {
         match self {
             Self::Sqlite(pool) => {
                 execute_select_sqlite(pool, sql, bind_values, offset, fetch_size).await
@@ -886,7 +1036,7 @@ impl DatabasePool {
         &self,
         sql: &str,
         bind_values: &[serde_json::Value],
-    ) -> Result<QueryResult, String> {
+    ) -> Result<QueryResult, QueryErrorInfo> {
         match self {
             Self::Sqlite(pool) => execute_mutation_sqlite(pool, sql, bind_values).await,
             Self::Postgres(pool) => execute_mutation_pg(pool, sql, bind_values).await,
@@ -903,7 +1053,7 @@ async fn execute_select_sqlite(
     bind_values: &[serde_json::Value],
     offset: u32,
     fetch_size: u32,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, QueryErrorInfo> {
     // Fetch one extra row to detect has_more
     let limit = (fetch_size + 1) as i64;
     let off = offset as i64;
@@ -917,7 +1067,7 @@ async fn execute_select_sqlite(
     let mut rows = query
         .fetch_all(pool)
         .await
-        .map_err(sanitize_query_error)?;
+        .map_err(|e| sanitize_query_error_rich(&e))?;
 
     let has_more = rows.len() > fetch_size as usize;
     if has_more {
@@ -955,7 +1105,7 @@ async fn execute_mutation_sqlite(
     pool: &sqlx::SqlitePool,
     sql: &str,
     bind_values: &[serde_json::Value],
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, QueryErrorInfo> {
     let mut query = sqlx::query(sql);
     for val in bind_values {
         query = bind_sqlite_value(query, val);
@@ -964,7 +1114,7 @@ async fn execute_mutation_sqlite(
     let result = query
         .execute(pool)
         .await
-        .map_err(sanitize_query_error)?;
+        .map_err(|e| sanitize_query_error_rich(&e))?;
 
     Ok(QueryResult {
         columns: Vec::new(),
@@ -1024,7 +1174,7 @@ async fn execute_select_pg(
     bind_values: &[serde_json::Value],
     offset: u32,
     fetch_size: u32,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, QueryErrorInfo> {
     let pg_sql = normalize_placeholders_to_pg(sql);
 
     let limit = (fetch_size + 1) as i64;
@@ -1041,7 +1191,7 @@ async fn execute_select_pg(
     let mut rows = query
         .fetch_all(pool)
         .await
-        .map_err(sanitize_query_error)?;
+        .map_err(|e| sanitize_query_error_rich(&e))?;
 
     let has_more = rows.len() > fetch_size as usize;
     if has_more {
@@ -1076,7 +1226,7 @@ async fn execute_mutation_pg(
     pool: &sqlx::PgPool,
     sql: &str,
     bind_values: &[serde_json::Value],
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, QueryErrorInfo> {
     let pg_sql = normalize_placeholders_to_pg(sql);
     let mut query = sqlx::query(&pg_sql);
     for val in bind_values {
@@ -1086,7 +1236,7 @@ async fn execute_mutation_pg(
     let result = query
         .execute(pool)
         .await
-        .map_err(sanitize_query_error)?;
+        .map_err(|e| sanitize_query_error_rich(&e))?;
 
     Ok(QueryResult {
         columns: Vec::new(),
@@ -1147,7 +1297,7 @@ async fn execute_select_mysql(
     bind_values: &[serde_json::Value],
     offset: u32,
     fetch_size: u32,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, QueryErrorInfo> {
     let limit = (fetch_size + 1) as i64;
     let off = offset as i64;
     let paginated_sql =
@@ -1161,7 +1311,7 @@ async fn execute_select_mysql(
     let mut rows = query
         .fetch_all(pool)
         .await
-        .map_err(sanitize_query_error)?;
+        .map_err(|e| sanitize_query_error_rich(&e))?;
 
     let has_more = rows.len() > fetch_size as usize;
     if has_more {
@@ -1196,7 +1346,7 @@ async fn execute_mutation_mysql(
     pool: &sqlx::MySqlPool,
     sql: &str,
     bind_values: &[serde_json::Value],
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, QueryErrorInfo> {
     let mut query = sqlx::query(sql);
     for val in bind_values {
         query = bind_mysql_value(query, val);
@@ -1205,7 +1355,7 @@ async fn execute_mutation_mysql(
     let result = query
         .execute(pool)
         .await
-        .map_err(sanitize_query_error)?;
+        .map_err(|e| sanitize_query_error_rich(&e))?;
 
     Ok(QueryResult {
         columns: Vec::new(),
@@ -1496,6 +1646,53 @@ pub(crate) fn contains_multiple_statements(sql: &str) -> bool {
     false
 }
 
+/// Split a SQL string on `;` boundaries that appear in code (not in strings,
+/// line comments, or block comments). Drops statements that are empty after
+/// trimming — callers get back exactly the statements they need to execute,
+/// in source order. A single-statement input returns a single-element Vec.
+pub fn split_statements(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let len = chars.len();
+    let mut scanner = SqlScanner::new();
+    let mut i = 0;
+    let mut current = String::new();
+    let mut statements: Vec<String> = Vec::new();
+
+    while i < len {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        let was_code = scanner.is_code();
+        let consumed = scanner.advance(ch, next);
+
+        if ch == ';' && was_code && scanner.is_code() {
+            // Boundary — emit current statement (without the `;`).
+            let trimmed = current.trim();
+            if !trimmed.is_empty() {
+                statements.push(trimmed.to_string());
+            }
+            current.clear();
+            i += consumed;
+            continue;
+        }
+
+        // Copy the consumed chars into the current statement buffer.
+        for j in 0..consumed {
+            if i + j < len {
+                current.push(chars[i + j]);
+            }
+        }
+        i += consumed;
+    }
+
+    let trailing = current.trim();
+    if !trailing.is_empty() {
+        statements.push(trailing.to_string());
+    }
+
+    statements
+}
+
 // --- Placeholder normalization (T10 fix: handles comments) ---
 
 /// Convert `?` placeholders to `$N` for Postgres.
@@ -1587,6 +1784,7 @@ mod tests {
                 query_timeout_ms INTEGER DEFAULT 30000,
                 ttl_seconds INTEGER DEFAULT 300,
                 max_pool_size INTEGER DEFAULT 5,
+                is_readonly INTEGER NOT NULL DEFAULT 0,
                 last_tested_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -1618,6 +1816,7 @@ mod tests {
                 query_timeout_ms: None,
                 ttl_seconds: None,
                 max_pool_size: None,
+                is_readonly: None,
             },
         )
         .await
@@ -1651,6 +1850,7 @@ mod tests {
                 query_timeout_ms: None,
                 ttl_seconds: None,
                 max_pool_size: None,
+                is_readonly: None,
             },
         )
         .await
@@ -1672,6 +1872,7 @@ mod tests {
                 query_timeout_ms: None,
                 ttl_seconds: None,
                 max_pool_size: None,
+                is_readonly: None,
             },
         )
         .await
@@ -1700,6 +1901,7 @@ mod tests {
                 query_timeout_ms: None,
                 ttl_seconds: None,
                 max_pool_size: None,
+                is_readonly: None,
             },
         )
         .await
@@ -1757,6 +1959,7 @@ mod tests {
             query_timeout_ms: 30000,
             ttl_seconds: 300,
             max_pool_size: 5,
+            is_readonly: false,
             last_tested_at: None,
             created_at: String::new(),
             updated_at: String::new(),
@@ -1953,6 +2156,7 @@ mod tests {
             query_timeout_ms: 30000,
             ttl_seconds: 300,
             max_pool_size: 0,
+            is_readonly: false,
             last_tested_at: None,
             created_at: String::new(),
             updated_at: String::new(),
@@ -1976,6 +2180,7 @@ mod tests {
             query_timeout_ms: 30000,
             ttl_seconds: 300,
             max_pool_size: -5,
+            is_readonly: false,
             last_tested_at: None,
             created_at: String::new(),
             updated_at: String::new(),
@@ -1999,6 +2204,7 @@ mod tests {
             query_timeout_ms: 30000,
             ttl_seconds: 300,
             max_pool_size: 200,
+            is_readonly: false,
             last_tested_at: None,
             created_at: String::new(),
             updated_at: String::new(),
@@ -2022,6 +2228,7 @@ mod tests {
             query_timeout_ms: 30000,
             ttl_seconds: 300,
             max_pool_size: 5,
+            is_readonly: false,
             last_tested_at: None,
             created_at: String::new(),
             updated_at: String::new(),
@@ -2048,6 +2255,7 @@ mod tests {
             query_timeout_ms: 30000,
             ttl_seconds: 300,
             max_pool_size: 10,
+            is_readonly: false,
             last_tested_at: None,
             created_at: String::new(),
             updated_at: String::new(),
@@ -2083,6 +2291,118 @@ mod tests {
     #[test]
     fn test_allow_semicolon_in_block_comment() {
         assert!(!contains_multiple_statements("SELECT 1 /* ; */ FROM t"));
+    }
+
+    // --- split_statements (stage 6) ---
+
+    #[test]
+    fn test_split_single_statement() {
+        assert_eq!(split_statements("SELECT 1"), vec!["SELECT 1"]);
+        assert_eq!(split_statements("SELECT 1;"), vec!["SELECT 1"]);
+        assert_eq!(
+            split_statements("  SELECT 1  ;  "),
+            vec!["SELECT 1"]
+        );
+    }
+
+    #[test]
+    fn test_split_multiple_statements() {
+        let r = split_statements("SELECT 1; SELECT 2; SELECT 3;");
+        assert_eq!(r, vec!["SELECT 1", "SELECT 2", "SELECT 3"]);
+    }
+
+    #[test]
+    fn test_split_preserves_string_semicolons() {
+        let r = split_statements("SELECT 'a;b'; SELECT 2");
+        assert_eq!(r, vec!["SELECT 'a;b'", "SELECT 2"]);
+    }
+
+    #[test]
+    fn test_split_skips_line_and_block_comments() {
+        let r = split_statements(
+            "SELECT 1 -- ; here\n; SELECT 2 /* ; inside */; SELECT 3",
+        );
+        assert_eq!(
+            r,
+            vec![
+                "SELECT 1 -- ; here".to_string(),
+                "SELECT 2 /* ; inside */".to_string(),
+                "SELECT 3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_drops_empty() {
+        assert!(split_statements("").is_empty());
+        assert!(split_statements(";;;").is_empty());
+        let r = split_statements("SELECT 1;;;SELECT 2");
+        assert_eq!(r, vec!["SELECT 1", "SELECT 2"]);
+    }
+
+    // --- QueryErrorLocation / position_to_line_col / mysql_line_from_message ---
+
+    #[test]
+    fn test_position_to_line_col_single_line() {
+        assert_eq!(position_to_line_col("SELECT foo FROM bar", 8), (1, 8));
+        assert_eq!(position_to_line_col("SELECT * FROM users", 1), (1, 1));
+    }
+
+    #[test]
+    fn test_position_to_line_col_multiline() {
+        let q = "SELECT *\nFROM users\nWHERE id = ?";
+        // position 10 (after first newline) → line 2 col 1
+        assert_eq!(position_to_line_col(q, 10), (2, 1));
+        // position 21 → line 3 col 1 (second newline at offset 19, so col 1)
+        let (line, _) = position_to_line_col(q, 21);
+        assert_eq!(line, 3);
+    }
+
+    #[test]
+    fn test_position_to_line_col_handles_zero() {
+        // A zero position is not valid (Postgres uses 1-indexed); fall back
+        // to (1,1) instead of panicking.
+        assert_eq!(position_to_line_col("SELECT 1", 0), (1, 1));
+    }
+
+    #[test]
+    fn test_mysql_line_from_message_parses_at_line() {
+        let msg = "You have an error in your SQL syntax; check the manual … near 'foo' at line 3";
+        assert_eq!(mysql_line_from_message(msg), Some(3));
+    }
+
+    #[test]
+    fn test_mysql_line_from_message_none_for_unrelated() {
+        assert_eq!(mysql_line_from_message("duplicate entry"), None);
+    }
+
+    #[test]
+    fn test_enrich_error_with_query_converts_pg_position() {
+        let mut info = QueryErrorInfo {
+            message: "Query failed: syntax error".to_string(),
+            location: QueryErrorLocation {
+                line: None,
+                column: Some(10),
+            },
+        };
+        enrich_error_with_query(&mut info, "SELECT *\nFROM oops");
+        // Position 10 is the "F" of "FROM" on line 2, col 1.
+        assert_eq!(info.location.line, Some(2));
+        assert_eq!(info.location.column, Some(1));
+    }
+
+    #[test]
+    fn test_enrich_error_preserves_mysql_line() {
+        let mut info = QueryErrorInfo {
+            message: "syntax error at line 3".to_string(),
+            location: QueryErrorLocation {
+                line: Some(3),
+                column: None,
+            },
+        };
+        enrich_error_with_query(&mut info, "SELECT 1");
+        assert_eq!(info.location.line, Some(3));
+        assert_eq!(info.location.column, None);
     }
 
     #[tokio::test]

@@ -6,6 +6,10 @@ use super::connections::{DatabasePool, PoolManager};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SchemaEntry {
+    /// Schema / database namespace. `None` for SQLite (single-namespace).
+    /// For MySQL this is the active database name; for Postgres the
+    /// `table_schema` column value, e.g. `public`, `vendas`, `app`.
+    pub schema_name: Option<String>,
     pub table_name: String,
     pub column_name: String,
     pub data_type: Option<String>,
@@ -38,11 +42,11 @@ pub async fn get_cached_schema(
     ttl_seconds: i64,
 ) -> Result<Option<Vec<SchemaEntry>>, String> {
     let rows = sqlx::query(
-        r#"SELECT table_name, column_name, data_type, cached_at
+        r#"SELECT schema_name, table_name, column_name, data_type, cached_at
         FROM schema_cache
         WHERE connection_id = ?
         AND (julianday('now') - julianday(cached_at)) * 86400 < ?
-        ORDER BY table_name, column_name"#,
+        ORDER BY schema_name IS NULL, schema_name, table_name, column_name"#,
     )
     .bind(connection_id)
     .bind(ttl_seconds)
@@ -57,6 +61,7 @@ pub async fn get_cached_schema(
     let entries: Vec<SchemaEntry> = rows
         .iter()
         .map(|row| SchemaEntry {
+            schema_name: row.try_get("schema_name").ok(),
             table_name: row.get("table_name"),
             column_name: row.get("column_name"),
             data_type: row.get("data_type"),
@@ -81,10 +86,11 @@ async fn save_to_cache(
     // Insert new entries
     for entry in entries {
         sqlx::query(
-            r#"INSERT INTO schema_cache (connection_id, table_name, column_name, data_type)
-            VALUES (?, ?, ?, ?)"#,
+            r#"INSERT INTO schema_cache (connection_id, schema_name, table_name, column_name, data_type)
+            VALUES (?, ?, ?, ?, ?)"#,
         )
         .bind(connection_id)
+        .bind(&entry.schema_name)
         .bind(&entry.table_name)
         .bind(&entry.column_name)
         .bind(&entry.data_type)
@@ -99,9 +105,10 @@ async fn save_to_cache(
 // --- Driver-specific introspection ---
 
 async fn introspect_sqlite(pool: &sqlx::SqlitePool) -> Result<Vec<SchemaEntry>, String> {
-    // Get all table names
-    let tables = sqlx::query(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    // Include tables AND views. Exclude sqlite-internal objects.
+    let objects = sqlx::query(
+        "SELECT name FROM sqlite_master \
+         WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'",
     )
     .fetch_all(pool)
     .await
@@ -109,9 +116,9 @@ async fn introspect_sqlite(pool: &sqlx::SqlitePool) -> Result<Vec<SchemaEntry>, 
 
     let mut entries = Vec::new();
 
-    for table_row in &tables {
-        let table_name: String = table_row.get("name");
-        let pragma = format!("PRAGMA table_info(\"{}\")", table_name);
+    for row in &objects {
+        let name: String = row.get("name");
+        let pragma = format!("PRAGMA table_info(\"{}\")", name);
         let columns = sqlx::query(&pragma)
             .fetch_all(pool)
             .await
@@ -119,7 +126,8 @@ async fn introspect_sqlite(pool: &sqlx::SqlitePool) -> Result<Vec<SchemaEntry>, 
 
         for col in &columns {
             entries.push(SchemaEntry {
-                table_name: table_name.clone(),
+                schema_name: None,
+                table_name: name.clone(),
                 column_name: col.get("name"),
                 data_type: col.try_get("type").ok(),
             });
@@ -130,11 +138,14 @@ async fn introspect_sqlite(pool: &sqlx::SqlitePool) -> Result<Vec<SchemaEntry>, 
 }
 
 async fn introspect_postgres(pool: &sqlx::PgPool) -> Result<Vec<SchemaEntry>, String> {
+    // `information_schema.columns` already spans tables, views, and materialized
+    // views. Exclude catalog schemas so regular users don't drown in 2k+ entries.
     let rows = sqlx::query(
-        r#"SELECT table_name, column_name, data_type
+        r#"SELECT table_schema, table_name, column_name, data_type
         FROM information_schema.columns
-        WHERE table_schema = 'public'
-        ORDER BY table_name, ordinal_position"#,
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+          AND table_schema NOT LIKE 'pg_%'
+        ORDER BY table_schema, table_name, ordinal_position"#,
     )
     .fetch_all(pool)
     .await
@@ -143,6 +154,7 @@ async fn introspect_postgres(pool: &sqlx::PgPool) -> Result<Vec<SchemaEntry>, St
     Ok(rows
         .iter()
         .map(|row| SchemaEntry {
+            schema_name: row.try_get::<String, _>("table_schema").ok(),
             table_name: row.get("table_name"),
             column_name: row.get("column_name"),
             data_type: row.try_get("data_type").ok(),
@@ -164,8 +176,11 @@ fn mysql_str(row: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
 }
 
 async fn introspect_mysql(pool: &sqlx::MySqlPool) -> Result<Vec<SchemaEntry>, String> {
+    // DATABASE() resolves via the USE issued in after_connect (see
+    // connections.rs build). information_schema.columns already includes
+    // columns for views; no extra join needed.
     let rows = sqlx::query(
-        r#"SELECT table_name, column_name, data_type
+        r#"SELECT table_schema, table_name, column_name, data_type
         FROM information_schema.columns
         WHERE table_schema = DATABASE()
         ORDER BY table_name, ordinal_position"#,
@@ -180,7 +195,9 @@ async fn introspect_mysql(pool: &sqlx::MySqlPool) -> Result<Vec<SchemaEntry>, St
             let table_name = mysql_str(row, "TABLE_NAME")?;
             let column_name = mysql_str(row, "COLUMN_NAME")?;
             let data_type = mysql_str(row, "DATA_TYPE");
+            let schema_name = mysql_str(row, "TABLE_SCHEMA");
             Some(SchemaEntry {
+                schema_name,
                 table_name,
                 column_name,
                 data_type,
@@ -211,6 +228,7 @@ mod tests {
                 query_timeout_ms INTEGER DEFAULT 30000,
                 ttl_seconds INTEGER DEFAULT 300,
                 max_pool_size INTEGER DEFAULT 5,
+                is_readonly INTEGER NOT NULL DEFAULT 0,
                 last_tested_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -224,11 +242,12 @@ mod tests {
             r#"CREATE TABLE schema_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 connection_id TEXT NOT NULL,
+                schema_name TEXT,
                 table_name TEXT NOT NULL,
                 column_name TEXT NOT NULL,
                 data_type TEXT,
                 cached_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(connection_id, table_name, column_name)
+                UNIQUE(connection_id, schema_name, table_name, column_name)
             )"#,
         )
         .execute(&app_pool)
@@ -250,6 +269,7 @@ mod tests {
                 query_timeout_ms: None,
                 ttl_seconds: None,
                 max_pool_size: None,
+                is_readonly: None,
             },
         )
         .await
@@ -320,5 +340,38 @@ mod tests {
 
         assert!(cached.iter().any(|e| e.table_name == "items" && e.column_name == "id"));
         assert!(cached.iter().any(|e| e.table_name == "items" && e.column_name == "val"));
+    }
+
+    #[tokio::test]
+    async fn test_introspect_sqlite_includes_views() {
+        let (manager, app_pool, conn_id) = setup_test_env().await;
+        let pool = manager.get_pool(&conn_id).await.unwrap();
+        match pool.as_ref() {
+            DatabasePool::Sqlite(p) => {
+                sqlx::query("CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)")
+                    .execute(p)
+                    .await
+                    .unwrap();
+                sqlx::query("CREATE VIEW big_orders AS SELECT * FROM orders WHERE total > 100")
+                    .execute(p)
+                    .await
+                    .unwrap();
+            }
+            _ => panic!("Expected SQLite"),
+        }
+
+        let entries = introspect_schema(&manager, &app_pool, &conn_id)
+            .await
+            .unwrap();
+
+        assert!(
+            entries.iter().any(|e| e.table_name == "orders"),
+            "expected orders table"
+        );
+        assert!(
+            entries.iter().any(|e| e.table_name == "big_orders"),
+            "expected big_orders view to appear alongside tables"
+        );
+        assert!(entries.iter().all(|e| e.schema_name.is_none()));
     }
 }
