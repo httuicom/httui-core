@@ -1047,6 +1047,16 @@ impl DatabasePool {
 
 // --- SQLite execution ---
 
+/// True only for statements that can legally be wrapped in
+/// `SELECT * FROM (<sql>) LIMIT … OFFSET …` for pagination — i.e. real
+/// SELECTs and CTEs. EXPLAIN, PRAGMA, SHOW, DESCRIBE all return rows
+/// but are not subqueryable in any of the three drivers, so they must
+/// run as-is.
+fn is_subqueryable_select(sql: &str) -> bool {
+    let trimmed = sql.trim_start().to_uppercase();
+    trimmed.starts_with("SELECT") || trimmed.starts_with("WITH")
+}
+
 async fn execute_select_sqlite(
     pool: &sqlx::SqlitePool,
     sql: &str,
@@ -1057,7 +1067,17 @@ async fn execute_select_sqlite(
     // Fetch one extra row to detect has_more
     let limit = (fetch_size + 1) as i64;
     let off = offset as i64;
-    let paginated_sql = format!("SELECT * FROM ({sql}) LIMIT {limit} OFFSET {off}");
+    // EXPLAIN / PRAGMA / SHOW / DESCRIBE can't be subqueried, so run them
+    // raw. We lose the `has_more` probe + pagination on those — fine,
+    // those statements never need either.
+    let (paginated_sql, paginated) = if is_subqueryable_select(sql) {
+        (
+            format!("SELECT * FROM ({sql}) LIMIT {limit} OFFSET {off}"),
+            true,
+        )
+    } else {
+        (sql.to_string(), false)
+    };
 
     let mut query = sqlx::query(&paginated_sql);
     for val in bind_values {
@@ -1069,7 +1089,10 @@ async fn execute_select_sqlite(
         .await
         .map_err(|e| sanitize_query_error_rich(&e))?;
 
-    let has_more = rows.len() > fetch_size as usize;
+    // `has_more` only meaningful when we paginated with a +1 probe row.
+    // Non-paginated runs (EXPLAIN/PRAGMA/SHOW/DESCRIBE) return their full
+    // output and never have "more".
+    let has_more = paginated && rows.len() > fetch_size as usize;
     if has_more {
         rows.pop(); // Remove the extra probe row
     }
@@ -1179,9 +1202,16 @@ async fn execute_select_pg(
 
     let limit = (fetch_size + 1) as i64;
     let off = offset as i64;
-    let paginated_sql = format!(
-        "SELECT * FROM ({pg_sql}) AS _p LIMIT {limit} OFFSET {off}"
-    );
+    // EXPLAIN / SHOW can't be a relation source in Postgres, so skip the
+    // pagination wrapper for them.
+    let (paginated_sql, paginated) = if is_subqueryable_select(&pg_sql) {
+        (
+            format!("SELECT * FROM ({pg_sql}) AS _p LIMIT {limit} OFFSET {off}"),
+            true,
+        )
+    } else {
+        (pg_sql, false)
+    };
 
     let mut query = sqlx::query(&paginated_sql);
     for val in bind_values {
@@ -1193,7 +1223,7 @@ async fn execute_select_pg(
         .await
         .map_err(|e| sanitize_query_error_rich(&e))?;
 
-    let has_more = rows.len() > fetch_size as usize;
+    let has_more = paginated && rows.len() > fetch_size as usize;
     if has_more {
         rows.pop();
     }
@@ -1300,8 +1330,15 @@ async fn execute_select_mysql(
 ) -> Result<QueryResult, QueryErrorInfo> {
     let limit = (fetch_size + 1) as i64;
     let off = offset as i64;
-    let paginated_sql =
-        format!("SELECT * FROM ({sql}) AS _p LIMIT {limit} OFFSET {off}");
+    // SHOW / DESCRIBE / EXPLAIN aren't subqueryable in MySQL — run raw.
+    let (paginated_sql, paginated) = if is_subqueryable_select(sql) {
+        (
+            format!("SELECT * FROM ({sql}) AS _p LIMIT {limit} OFFSET {off}"),
+            true,
+        )
+    } else {
+        (sql.to_string(), false)
+    };
 
     let mut query = sqlx::query(&paginated_sql);
     for val in bind_values {
@@ -1313,7 +1350,7 @@ async fn execute_select_mysql(
         .await
         .map_err(|e| sanitize_query_error_rich(&e))?;
 
-    let has_more = rows.len() > fetch_size as usize;
+    let has_more = paginated && rows.len() > fetch_size as usize;
     if has_more {
         rows.pop();
     }

@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::blocks::parser::{self, ParsedBlock};
+use crate::blocks::registry::BlockTypeRegistry;
 use crate::db::environments;
 use crate::executor::{BlockRequest, BlockResult, ExecutorRegistry};
-use crate::parser::{self, ParsedBlock};
 use crate::references;
 
 const MAX_DEPENDENCY_DEPTH: usize = 50;
@@ -37,12 +38,30 @@ impl std::error::Error for RunnerError {}
 /// Executes blocks from raw markdown with full dependency and environment resolution.
 pub struct BlockRunner {
     registry: Arc<ExecutorRegistry>,
+    type_registry: BlockTypeRegistry,
     pool: sqlx::sqlite::SqlitePool,
 }
 
 impl BlockRunner {
+    /// Build a runner with the default [`BlockTypeRegistry`] (recognizes
+    /// the http / e2e / db family shipped with the core).
     pub fn new(registry: Arc<ExecutorRegistry>, pool: sqlx::sqlite::SqlitePool) -> Self {
-        Self { registry, pool }
+        Self::with_type_registry(registry, BlockTypeRegistry::default(), pool)
+    }
+
+    /// Build a runner with a custom type registry — used to register new
+    /// block-type aliases (e.g. `graphql-http` → `graphql`) without
+    /// modifying core sources.
+    pub fn with_type_registry(
+        registry: Arc<ExecutorRegistry>,
+        type_registry: BlockTypeRegistry,
+        pool: sqlx::sqlite::SqlitePool,
+    ) -> Self {
+        Self {
+            registry,
+            type_registry,
+            pool,
+        }
     }
 
     /// Execute a block by alias from a note file.
@@ -155,12 +174,8 @@ impl BlockRunner {
         // Resolve all placeholders in params
         let resolved_params = references::resolve_all(&block.params, executed, env_vars);
 
-        // Normalize block_type
-        let block_type = if block.block_type.starts_with("db-") || block.block_type == "db" {
-            "db".to_string()
-        } else {
-            block.block_type.clone()
-        };
+        // Map surface block type to canonical executor name (e.g. db-postgres → db)
+        let block_type = self.type_registry.canonicalize(&block.block_type).to_string();
 
         // Execute
         let req = BlockRequest {

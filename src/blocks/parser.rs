@@ -61,6 +61,8 @@ pub fn parse_blocks(markdown: &str) -> Vec<ParsedBlock> {
                 let body = body_lines.join("\n");
                 let params = if is_db_block(&block_type) {
                     parse_db_body(&body, &attrs)
+                } else if block_type == "http" {
+                    parse_http_body(&body, &attrs)
                 } else {
                     serde_json::from_str(&body).unwrap_or(serde_json::Value::Null)
                 };
@@ -154,6 +156,251 @@ fn synthesize_db_params_from_info(
     }
 
     serde_json::Value::Object(obj)
+}
+
+/// Parse an http block body, detecting legacy JSON vs. new HTTP-message format.
+///
+/// Legacy JSON is detected when the trimmed body starts with `{` AND parses as
+/// a JSON object with string `method` and `url` fields. Otherwise the body is
+/// treated as an HTTP message (`METHOD URL` line, headers, blank line, body)
+/// and synthesized into the same JSON shape downstream consumers expect.
+fn parse_http_body(body: &str, attrs: &HashMap<String, String>) -> serde_json::Value {
+    if let Some(legacy) = parse_legacy_http_body(body) {
+        return legacy;
+    }
+    parse_http_message_body(body, attrs)
+}
+
+fn parse_legacy_http_body(body: &str) -> Option<serde_json::Value> {
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let obj = value.as_object()?;
+    if !obj.get("method").is_some_and(|v| v.is_string()) {
+        return None;
+    }
+    if !obj.get("url").is_some_and(|v| v.is_string()) {
+        return None;
+    }
+    Some(value)
+}
+
+/// Parse an HTTP-message-formatted body into the JSON shape expected by the
+/// executor: `{ method, url, params: [{key, value}], headers: [{key, value}], body, timeout_ms? }`.
+///
+/// Disabled rows (`# ` prefix) and descriptions (`# desc:` above a row) are
+/// stripped — the executor doesn't care about them.
+fn parse_http_message_body(body: &str, attrs: &HashMap<String, String>) -> serde_json::Value {
+    let lines: Vec<&str> = body.split('\n').collect();
+    let mut i = 0;
+
+    // Skip leading blanks and `#` comments.
+    while i < lines.len() {
+        let t = lines[i].trim();
+        if t.is_empty() || t.starts_with('#') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+
+    if i >= lines.len() {
+        return empty_http_params(attrs);
+    }
+
+    let first_line = lines[i].trim().to_string();
+    i += 1;
+
+    let (method, url, mut params) = match parse_http_first_line(&first_line) {
+        Some(v) => v,
+        None => return empty_http_params(attrs),
+    };
+
+    // Phase 1: query continuations and headers, until first blank line.
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut saw_header = false;
+
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = raw.trim();
+
+        if trimmed.is_empty() {
+            i += 1;
+            break;
+        }
+
+        // Disabled marker (`# ` with space) — strip and treat the rest as a
+        // disabled row, which the executor ignores entirely.
+        if trimmed == "#" || trimmed.starts_with("# ") {
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            // Free-form comment, ignored.
+            i += 1;
+            continue;
+        }
+
+        if !saw_header && (trimmed.starts_with('?') || trimmed.starts_with('&')) {
+            let seg = &trimmed[1..];
+            if let Some((k, v)) = split_query_segment(seg) {
+                params.push((k, v));
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some((k, v)) = split_header_line(trimmed) {
+            headers.push((k, v));
+            saw_header = true;
+        }
+        i += 1;
+    }
+
+    // Phase 2: body. Drop trailing blank lines for idempotency.
+    let mut body_lines: Vec<&str> = lines[i..].to_vec();
+    while body_lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+        body_lines.pop();
+    }
+    let body_text = body_lines.join("\n");
+
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "method".to_string(),
+        serde_json::Value::String(method),
+    );
+    obj.insert("url".to_string(), serde_json::Value::String(url));
+    obj.insert(
+        "params".to_string(),
+        serde_json::Value::Array(
+            params
+                .into_iter()
+                .map(|(k, v)| {
+                    let mut m = serde_json::Map::new();
+                    m.insert("key".to_string(), serde_json::Value::String(k));
+                    m.insert("value".to_string(), serde_json::Value::String(v));
+                    serde_json::Value::Object(m)
+                })
+                .collect(),
+        ),
+    );
+    obj.insert(
+        "headers".to_string(),
+        serde_json::Value::Array(
+            headers
+                .into_iter()
+                .map(|(k, v)| {
+                    let mut m = serde_json::Map::new();
+                    m.insert("key".to_string(), serde_json::Value::String(k));
+                    m.insert("value".to_string(), serde_json::Value::String(v));
+                    serde_json::Value::Object(m)
+                })
+                .collect(),
+        ),
+    );
+    obj.insert(
+        "body".to_string(),
+        serde_json::Value::String(body_text),
+    );
+
+    if let Some(timeout_str) = attrs.get("timeout") {
+        if let Ok(timeout) = timeout_str.parse::<u64>() {
+            obj.insert(
+                "timeout_ms".to_string(),
+                serde_json::Value::Number(timeout.into()),
+            );
+        }
+    }
+
+    serde_json::Value::Object(obj)
+}
+
+fn empty_http_params(attrs: &HashMap<String, String>) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "method".to_string(),
+        serde_json::Value::String("GET".to_string()),
+    );
+    obj.insert("url".to_string(), serde_json::Value::String(String::new()));
+    obj.insert("params".to_string(), serde_json::Value::Array(vec![]));
+    obj.insert("headers".to_string(), serde_json::Value::Array(vec![]));
+    obj.insert("body".to_string(), serde_json::Value::String(String::new()));
+    if let Some(timeout_str) = attrs.get("timeout") {
+        if let Ok(timeout) = timeout_str.parse::<u64>() {
+            obj.insert(
+                "timeout_ms".to_string(),
+                serde_json::Value::Number(timeout.into()),
+            );
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
+type HttpRequestLine = (String, String, Vec<(String, String)>);
+
+/// Returns `(method, url, inline_query_params)` or `None` if the line is not a
+/// valid request line.
+fn parse_http_first_line(line: &str) -> Option<HttpRequestLine> {
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let method = parts.next()?.to_string();
+    let rest = parts.next()?.trim().to_string();
+    if !is_known_http_method(&method) {
+        return None;
+    }
+    let mut params = Vec::new();
+    let (url, inline_query) = match rest.find('?') {
+        Some(idx) => (rest[..idx].to_string(), Some(rest[idx + 1..].to_string())),
+        None => (rest, None),
+    };
+    if let Some(q) = inline_query {
+        for seg in q.split('&') {
+            if seg.is_empty() {
+                continue;
+            }
+            if let Some(kv) = split_query_segment(seg) {
+                params.push(kv);
+            }
+        }
+    }
+    Some((method, url, params))
+}
+
+fn is_known_http_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+    )
+}
+
+fn split_query_segment(seg: &str) -> Option<(String, String)> {
+    if seg.is_empty() {
+        return None;
+    }
+    match seg.find('=') {
+        Some(idx) => {
+            let key = seg[..idx].to_string();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key, seg[idx + 1..].to_string()))
+        }
+        None => Some((seg.to_string(), String::new())),
+    }
+}
+
+fn split_header_line(line: &str) -> Option<(String, String)> {
+    let idx = line.find(':')?;
+    if idx == 0 {
+        return None;
+    }
+    let key = line[..idx].trim().to_string();
+    let value = line[idx + 1..].trim().to_string();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, value))
 }
 
 /// Find a block by alias in a list of parsed blocks.
@@ -346,13 +593,17 @@ print("world")
 
     #[test]
     fn test_invalid_json_body() {
+        // Post-redesign: a non-JSON, non-HTTP-message body falls back to an
+        // empty HTTP shape (executor receives a well-formed shape it can
+        // gracefully fail on).
         let md = r#"```http alias=broken
 not valid json
 ```
 "#;
         let blocks = parse_blocks(md);
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].params, serde_json::Value::Null);
+        assert_eq!(blocks[0].params["method"], "GET");
+        assert_eq!(blocks[0].params["url"], "");
     }
 
     #[test]
@@ -538,10 +789,182 @@ WHERE id > 10
 
     #[test]
     fn test_http_block_ignores_db_heuristic() {
-        // If an http body looks db-like, it should still fail as JSON (not
-        // synthesized as a query).
+        // If an http body looks db-like, the http parser falls back to an
+        // empty HTTP shape (it never synthesizes a SQL query).
         let md = "```http alias=x\nSELECT 1\n```\n";
         let blocks = parse_blocks(md);
-        assert_eq!(blocks[0].params, serde_json::Value::Null);
+        assert!(blocks[0].params.get("query").is_none());
+        assert_eq!(blocks[0].params["url"], "");
+    }
+
+    // ───── New HTTP fence format (HTTP message body) ─────
+
+    #[test]
+    fn test_parse_http_new_format_get_simple() {
+        let md = "```http alias=req1\nGET https://api.example.com/users\n```\n";
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_type, "http");
+        assert_eq!(blocks[0].alias.as_deref(), Some("req1"));
+        assert_eq!(blocks[0].params["method"], "GET");
+        assert_eq!(blocks[0].params["url"], "https://api.example.com/users");
+        assert_eq!(blocks[0].params["params"], serde_json::json!([]));
+        assert_eq!(blocks[0].params["headers"], serde_json::json!([]));
+        assert_eq!(blocks[0].params["body"], "");
+    }
+
+    #[test]
+    fn test_parse_http_new_format_inline_query() {
+        let md = "```http\nGET https://api.example.com/users?page=1&limit=10\n```\n";
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks[0].params["url"], "https://api.example.com/users");
+        assert_eq!(
+            blocks[0].params["params"],
+            serde_json::json!([
+                {"key": "page", "value": "1"},
+                {"key": "limit", "value": "10"},
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_http_new_format_query_continuation() {
+        let md = "```http\nGET https://api.example.com/users\n?page=1\n&limit=10\n```\n";
+        let blocks = parse_blocks(md);
+        assert_eq!(
+            blocks[0].params["params"],
+            serde_json::json!([
+                {"key": "page", "value": "1"},
+                {"key": "limit", "value": "10"},
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_http_new_format_with_headers_and_body() {
+        let md = r#"```http alias=createUser
+POST https://api.example.com/users
+Authorization: Bearer xyz
+Content-Type: application/json
+
+{"name":"alice"}
+```
+"#;
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks[0].params["method"], "POST");
+        assert_eq!(blocks[0].params["url"], "https://api.example.com/users");
+        assert_eq!(
+            blocks[0].params["headers"],
+            serde_json::json!([
+                {"key": "Authorization", "value": "Bearer xyz"},
+                {"key": "Content-Type", "value": "application/json"},
+            ])
+        );
+        assert_eq!(blocks[0].params["body"], "{\"name\":\"alice\"}");
+    }
+
+    #[test]
+    fn test_parse_http_new_format_disabled_rows_dropped_for_executor() {
+        let md = r#"```http
+GET https://example.com
+?page=1
+# &cursor=abc
+Authorization: Bearer x
+# X-Debug: 1
+```
+"#;
+        let blocks = parse_blocks(md);
+        // Disabled rows are stripped — the executor never sees them.
+        assert_eq!(
+            blocks[0].params["params"],
+            serde_json::json!([{"key": "page", "value": "1"}])
+        );
+        assert_eq!(
+            blocks[0].params["headers"],
+            serde_json::json!([{"key": "Authorization", "value": "Bearer x"}])
+        );
+    }
+
+    #[test]
+    fn test_parse_http_new_format_descriptions_stripped() {
+        let md = r#"```http
+GET https://example.com
+# desc: page index
+?page=1
+# desc: bearer
+Authorization: Bearer x
+```
+"#;
+        let blocks = parse_blocks(md);
+        assert_eq!(
+            blocks[0].params["params"],
+            serde_json::json!([{"key": "page", "value": "1"}])
+        );
+        assert_eq!(
+            blocks[0].params["headers"],
+            serde_json::json!([{"key": "Authorization", "value": "Bearer x"}])
+        );
+    }
+
+    #[test]
+    fn test_parse_http_new_format_timeout_from_info_string() {
+        let md = "```http alias=x timeout=5000\nGET https://example.com\n```\n";
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks[0].params["timeout_ms"], 5000);
+    }
+
+    #[test]
+    fn test_parse_http_new_format_preserves_body_blank_lines() {
+        let md = "```http\nPOST https://example.com\nContent-Type: text/plain\n\nline1\n\nline3\n```\n";
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks[0].params["body"], "line1\n\nline3");
+    }
+
+    #[test]
+    fn test_parse_http_new_format_unknown_method_falls_back() {
+        let md = "```http\nFETCH https://example.com\n```\n";
+        let blocks = parse_blocks(md);
+        // FETCH is not a known method, so first-line parse fails and we get
+        // an empty shape.
+        assert_eq!(blocks[0].params["method"], "GET");
+        assert_eq!(blocks[0].params["url"], "");
+    }
+
+    // ───── Legacy HTTP JSON body — must keep working ─────
+
+    #[test]
+    fn test_parse_http_legacy_format_still_works() {
+        let md = r#"```http alias=login displayMode=split
+{"method":"POST","url":"https://api.test.com/login","params":[],"headers":[],"body":"{\"user\":\"admin\"}"}
+```
+"#;
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks[0].params["method"], "POST");
+        assert_eq!(blocks[0].params["url"], "https://api.test.com/login");
+        assert_eq!(blocks[0].params["body"], "{\"user\":\"admin\"}");
+    }
+
+    #[test]
+    fn test_parse_http_legacy_format_preserves_extra_fields() {
+        // Legacy bodies may carry extra fields; the parser passes them through.
+        let md = r#"```http
+{"method":"GET","url":"https://example.com","params":[{"key":"a","value":"1"}],"headers":[],"body":"","timeout_ms":5000}
+```
+"#;
+        let blocks = parse_blocks(md);
+        assert_eq!(
+            blocks[0].params["params"],
+            serde_json::json!([{"key": "a", "value": "1"}])
+        );
+        assert_eq!(blocks[0].params["timeout_ms"], 5000);
+    }
+
+    #[test]
+    fn test_parse_http_json_without_method_is_treated_as_message() {
+        // A JSON-looking body that lacks `method`/`url` is not legacy; it
+        // tries the message parser, which fails, and we get the empty shape.
+        let md = "```http\n{\"foo\":\"bar\"}\n```\n";
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks[0].params["url"], "");
     }
 }
