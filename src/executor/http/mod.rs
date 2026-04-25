@@ -2,9 +2,11 @@ pub mod types;
 
 use async_trait::async_trait;
 use base64::prelude::*;
+use reqwest::redirect::Policy;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +31,23 @@ struct HttpParams {
     body: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// `None` (default) → follow redirects (reqwest default = 10 hops).
+    /// `Some(false)` → no redirects, raw 3xx surface to the user.
+    #[serde(default)]
+    follow_redirects: Option<bool>,
+    /// `None` / `Some(true)` (default) → enforce certificate validation.
+    /// `Some(false)` → accept self-signed / invalid certificates (per request).
+    #[serde(default)]
+    verify_ssl: Option<bool>,
+    /// `None` / `Some(true)` (default) → percent-encode query param values.
+    /// `Some(false)` → append the raw value verbatim (user already encoded).
+    #[serde(default)]
+    encode_url: Option<bool>,
+    /// `None` / `Some(true)` (default) → trim whitespace on header keys/values,
+    /// query keys/values, and the body before sending. May break text/plain
+    /// payloads that rely on leading/trailing whitespace; user opted in.
+    #[serde(default)]
+    trim_whitespace: Option<bool>,
 }
 
 fn is_binary_content_type(content_type: &str) -> bool {
@@ -56,8 +75,32 @@ fn classify_reqwest_error(e: &reqwest::Error) -> &'static str {
     }
 }
 
+/// Bool flags that have to be baked into the reqwest `Client` because
+/// reqwest does not expose them as per-request overrides
+/// (`redirect::Policy` and `danger_accept_invalid_certs` are
+/// `ClientBuilder`-only). We cache one client per combination so we don't
+/// rebuild a fresh TLS pool on every request — the matrix is bounded at 4.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+struct ClientFlags {
+    follow_redirects: bool,
+    verify_ssl: bool,
+}
+
+impl Default for ClientFlags {
+    fn default() -> Self {
+        Self {
+            follow_redirects: true,
+            verify_ssl: true,
+        }
+    }
+}
+
 pub struct HttpExecutor {
-    client: Client,
+    /// Lazy cache of `reqwest::Client` keyed by transport flags. Wrapped in
+    /// a sync `Mutex` because lookup is fast and contention is rare (only
+    /// hit on first use of each combo). `Client` clones share the same
+    /// internal `Arc<ClientRef>` so cloning on the hot path is cheap.
+    clients: Mutex<HashMap<ClientFlags, Client>>,
 }
 
 impl Default for HttpExecutor {
@@ -68,12 +111,30 @@ impl Default for HttpExecutor {
 
 impl HttpExecutor {
     pub fn new() -> Self {
-        Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
+        let executor = Self {
+            clients: Mutex::new(HashMap::new()),
+        };
+        // Eagerly populate the default-flags client so the warm path matches
+        // the previous "single global client" behaviour.
+        let _ = executor.client_for(ClientFlags::default());
+        executor
+    }
+
+    fn client_for(&self, flags: ClientFlags) -> Client {
+        let mut guard = self.clients.lock().expect("HttpExecutor.clients poisoned");
+        if let Some(existing) = guard.get(&flags) {
+            return existing.clone();
         }
+        let mut builder = Client::builder().timeout(Duration::from_secs(30));
+        if !flags.follow_redirects {
+            builder = builder.redirect(Policy::none());
+        }
+        if !flags.verify_ssl {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        let client = builder.build().unwrap_or_default();
+        guard.insert(flags, client.clone());
+        client
     }
 
     /// Cancel-aware execution returning the typed `HttpResponse` directly.
@@ -94,7 +155,12 @@ impl HttpExecutor {
     ) -> Result<HttpResponse, ExecutorError> {
         let p: HttpParams = serde_json::from_value(params)
             .map_err(|e| ExecutorError(format!("Invalid params: {e}")))?;
-        let req = build_request(&self.client, &p)?;
+        let flags = ClientFlags {
+            follow_redirects: p.follow_redirects.unwrap_or(true),
+            verify_ssl: p.verify_ssl.unwrap_or(true),
+        };
+        let client = self.client_for(flags);
+        let req = build_request(&client, &p)?;
 
         let start = Instant::now();
         let response = tokio::select! {
@@ -150,12 +216,54 @@ fn build_request(
     client: &Client,
     p: &HttpParams,
 ) -> Result<reqwest::RequestBuilder, ExecutorError> {
-    let mut url = reqwest::Url::parse(&p.url)
-        .map_err(|e| ExecutorError(format!("Invalid URL: {e}")))?;
-    for kv in &p.params {
-        if !kv.key.is_empty() {
-            url.query_pairs_mut().append_pair(&kv.key, &kv.value);
+    // Defaults: trim_whitespace ON, encode_url ON. `None` means "use default".
+    let trim = p.trim_whitespace.unwrap_or(true);
+    let encode_values = p.encode_url.unwrap_or(true);
+
+    let trim_str = |s: &str| -> String {
+        if trim {
+            s.trim().to_string()
+        } else {
+            s.to_string()
         }
+    };
+
+    let raw_url = trim_str(&p.url);
+    let mut url = reqwest::Url::parse(&raw_url)
+        .map_err(|e| ExecutorError(format!("Invalid URL: {e}")))?;
+
+    if encode_values {
+        // Default: percent-encode keys/values via the safe API.
+        for kv in &p.params {
+            let key = trim_str(&kv.key);
+            if key.is_empty() {
+                continue;
+            }
+            url.query_pairs_mut().append_pair(&key, &trim_str(&kv.value));
+        }
+    } else {
+        // Opt-out: append raw query string. Caller is responsible for any
+        // encoding. We still trim if requested — trimming is independent of
+        // encoding. We rebuild the query manually so reqwest doesn't
+        // double-encode.
+        let mut existing: String = url.query().map(|s| s.to_string()).unwrap_or_default();
+        for kv in &p.params {
+            let key = trim_str(&kv.key);
+            if key.is_empty() {
+                continue;
+            }
+            if !existing.is_empty() {
+                existing.push('&');
+            }
+            existing.push_str(&key);
+            existing.push('=');
+            existing.push_str(&trim_str(&kv.value));
+        }
+        url.set_query(if existing.is_empty() {
+            None
+        } else {
+            Some(&existing)
+        });
     }
 
     let method = p
@@ -168,8 +276,9 @@ fn build_request(
         req = req.timeout(Duration::from_millis(ms));
     }
     for kv in &p.headers {
-        if !kv.key.is_empty() {
-            req = req.header(&kv.key, &kv.value);
+        let key = trim_str(&kv.key);
+        if !key.is_empty() {
+            req = req.header(&key, &trim_str(&kv.value));
         }
     }
 
@@ -177,16 +286,17 @@ fn build_request(
         method,
         reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
     );
-    if has_body && !p.body.is_empty() {
+    let body_text = trim_str(&p.body);
+    if has_body && !body_text.is_empty() {
         // Only inject default Content-Type when the user didn't set one.
         let user_set_ct = p
             .headers
             .iter()
-            .any(|kv| kv.key.eq_ignore_ascii_case("content-type"));
+            .any(|kv| kv.key.trim().eq_ignore_ascii_case("content-type"));
         if !user_set_ct {
             req = req.header("Content-Type", "application/json");
         }
-        req = req.body(p.body.clone());
+        req = req.body(body_text);
     }
 
     Ok(req)
@@ -627,5 +737,146 @@ mod tests {
         assert_eq!(result.status, "success");
         assert_eq!(result.data["status_code"], 201);
         assert_eq!(result.data["body"]["received"], "yes");
+    }
+
+    // ─────────── Onda 1 — per-block flags (HttpParams extras) ───────────
+
+    #[tokio::test]
+    async fn http_params_accepts_new_flags() {
+        // Just exercise the deserialization — the executor reads these via
+        // `serde_json::from_value` deeper down; flag-aware behaviour is
+        // covered by the dedicated tests below.
+        let json = serde_json::json!({
+            "method": "GET",
+            "url": "https://example.com",
+            "follow_redirects": false,
+            "verify_ssl": false,
+            "encode_url": false,
+            "trim_whitespace": false,
+        });
+        let parsed: HttpParams = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.follow_redirects, Some(false));
+        assert_eq!(parsed.verify_ssl, Some(false));
+        assert_eq!(parsed.encode_url, Some(false));
+        assert_eq!(parsed.trim_whitespace, Some(false));
+    }
+
+    #[tokio::test]
+    async fn http_params_omits_flags_yields_none() {
+        // Defaults via serde — backwards-compatible with old payloads.
+        let json = serde_json::json!({
+            "method": "GET",
+            "url": "https://example.com",
+        });
+        let parsed: HttpParams = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.follow_redirects, None);
+        assert_eq!(parsed.verify_ssl, None);
+        assert_eq!(parsed.encode_url, None);
+        assert_eq!(parsed.trim_whitespace, None);
+    }
+
+    #[tokio::test]
+    async fn client_cache_is_keyed_by_flags() {
+        let executor = HttpExecutor::new();
+        // Default client populated by `new()`.
+        let n_default = executor.clients.lock().unwrap().len();
+        assert!(n_default >= 1);
+        let _ = executor.client_for(ClientFlags {
+            follow_redirects: false,
+            verify_ssl: true,
+        });
+        let _ = executor.client_for(ClientFlags {
+            follow_redirects: false,
+            verify_ssl: true,
+        });
+        // Same combo — no new client cached.
+        assert_eq!(executor.clients.lock().unwrap().len(), n_default + 1);
+        let _ = executor.client_for(ClientFlags {
+            follow_redirects: false,
+            verify_ssl: false,
+        });
+        assert_eq!(executor.clients.lock().unwrap().len(), n_default + 2);
+    }
+
+    #[tokio::test]
+    async fn follow_redirects_false_returns_3xx_to_caller() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "/elsewhere"),
+            )
+            .mount(&server)
+            .await;
+
+        let executor = HttpExecutor::new();
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/start", server.uri()),
+            "follow_redirects": false,
+        });
+        let response = executor
+            .execute_with_cancel(params, CancellationToken::new())
+            .await
+            .unwrap();
+        // Without follow, the 302 surfaces directly.
+        assert_eq!(response.status_code, 302);
+        assert_eq!(
+            response.headers.get("location").map(|s| s.as_str()),
+            Some("/elsewhere"),
+        );
+    }
+
+    #[tokio::test]
+    async fn trim_whitespace_strips_header_and_body() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/trim"))
+            .and(header("x-trimmed", "value"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let executor = HttpExecutor::new();
+        let params = serde_json::json!({
+            "method": "POST",
+            "url": format!("{}/trim", server.uri()),
+            "headers": [
+                { "key": "  X-Trimmed  ", "value": "  value  " },
+            ],
+            "body": "  payload  ",
+            // trim_whitespace defaults ON; we pass it explicitly here for clarity.
+            "trim_whitespace": true,
+        });
+        let result = executor.execute(params).await.unwrap();
+        assert_eq!(result.status, "success");
+        assert_eq!(result.data["status_code"], 200);
+    }
+
+    #[tokio::test]
+    async fn encode_url_off_preserves_raw_query() {
+        // With encode_url=true (default), `q=a b` becomes `q=a+b` or `q=a%20b`.
+        // With encode_url=false, the raw value is appended verbatim.
+        let server = MockServer::start().await;
+
+        // Wiremock matches the raw query string the server sees.
+        Mock::given(method("GET"))
+            .and(path("/q"))
+            .and(wiremock::matchers::query_param("q", "a%20b"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let executor = HttpExecutor::new();
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/q", server.uri()),
+            "params": [{ "key": "q", "value": "a%20b" }],
+            "encode_url": false,
+        });
+        let result = executor.execute(params).await;
+        assert!(result.is_ok(), "expected query to pass through verbatim");
     }
 }

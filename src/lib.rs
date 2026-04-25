@@ -1,5 +1,6 @@
 pub mod block_history;
 pub mod block_results;
+pub mod block_settings;
 pub mod blocks;
 pub mod config;
 pub mod db;
