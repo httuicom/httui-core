@@ -2731,4 +2731,106 @@ mod tests {
         // case above is what we really care about.
         let _ = ok;
     }
+
+    // ─────── Cache invalidation: update_connection → next query uses new pool ───────
+
+    #[tokio::test]
+    async fn update_connection_followed_by_invalidate_yields_fresh_pool() {
+        // Epic 16, Story 05 invariant (L102): the Tauri command sequence
+        // (update_connection → conn_manager.invalidate) must guarantee
+        // that the next `get_pool` call returns a pool built from the
+        // updated row, not a stale cached one.
+        //
+        // We can't test the full Tauri command from here, but we can
+        // assert the invariant on the `PoolManager` it ultimately calls:
+        // (1) without invalidate, the cache survives an update; (2) after
+        // invalidate, the next get_pool creates a fresh Arc whose
+        // PoolEntry reflects the new config. This is the bug the L102
+        // task was designed to catch — a regression where invalidate
+        // stops being called would leak stale config.
+        let pool = setup_test_pool().await;
+        let manager = std::sync::Arc::new(PoolManager::new_standalone(pool.clone()));
+
+        let created = create_connection(
+            &pool,
+            CreateConnection {
+                name: "pool-invalidate-test".to_string(),
+                driver: "sqlite".to_string(),
+                host: None,
+                port: None,
+                database_name: Some(":memory:".to_string()),
+                username: None,
+                password: None,
+                ssl_mode: None,
+                timeout_ms: Some(5000),
+                query_timeout_ms: Some(10000),
+                ttl_seconds: Some(300),
+                max_pool_size: Some(2),
+                is_readonly: None,
+            },
+        )
+        .await
+        .expect("create_connection (sqlite) must succeed");
+
+        let id = created.id.clone();
+
+        // First get_pool: pool is created and cached with timeout=10000.
+        let pool_a = manager
+            .get_pool(&id)
+            .await
+            .expect("get_pool must succeed");
+        assert_eq!(manager.get_query_timeout(&id).await, Some(10000));
+
+        // Update the row's query_timeout_ms in the database.
+        update_connection(
+            &pool,
+            &id,
+            UpdateConnection {
+                name: None,
+                driver: None,
+                host: None,
+                port: None,
+                database_name: None,
+                username: None,
+                password: None,
+                ssl_mode: None,
+                timeout_ms: None,
+                query_timeout_ms: Some(99000),
+                ttl_seconds: None,
+                max_pool_size: None,
+                is_readonly: None,
+            },
+        )
+        .await
+        .expect("update_connection must succeed");
+
+        // Without invalidate, the cache is still serving the old timeout.
+        // This documents the (intentional) fact that PoolManager has no
+        // automatic awareness of DB row changes — it relies on the
+        // caller (the Tauri command) to invalidate.
+        assert_eq!(
+            manager.get_query_timeout(&id).await,
+            Some(10000),
+            "cache must survive an update with no invalidate (documents the invariant)",
+        );
+
+        // Tauri command's invalidate step.
+        manager.invalidate(&id).await;
+
+        // Next get_pool builds a fresh pool from the current DB row.
+        let pool_b = manager
+            .get_pool(&id)
+            .await
+            .expect("get_pool after invalidate must succeed");
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&pool_a, &pool_b),
+            "pool Arc must differ — cache was rebuilt, not reused",
+        );
+        assert_eq!(
+            manager.get_query_timeout(&id).await,
+            Some(99000),
+            "rebuilt PoolEntry must reflect the updated row's query_timeout_ms",
+        );
+    }
 }
