@@ -10,9 +10,9 @@ use crate::blocks::parser::ParsedBlock;
 /// - `db` family — info string `<type> [alias=…] [connection=…] [limit=…] [timeout=…] [display=…]`,
 ///   body is the raw SQL stored in `params.query`. Mirrors the canonical
 ///   form documented in `src/lib/blocks/db-fence.ts`.
-/// - `http`, `e2e` — info string `<type> [alias=…] [displayMode=…]`,
+/// - `http` — info string `<type> [alias=…] [displayMode=…]`,
 ///   body is `params` rendered as compact JSON.
-/// - Unknown types — same as http/e2e (JSON body fallback). New block
+/// - Unknown types — same as http (JSON body fallback). New block
 ///   types can ship without a dedicated serializer until their fence
 ///   shape is finalized.
 pub fn serialize_block(block: &ParsedBlock) -> String {
@@ -151,20 +151,6 @@ mod tests {
     #[test]
     fn roundtrip_db_with_display_only() {
         let md = "```db alias=q display=output\nSELECT 1\n```\n";
-        assert_semantic_roundtrip(md);
-        assert_idempotent(md);
-    }
-
-    #[test]
-    fn roundtrip_e2e_one_step() {
-        let md = "```e2e alias=flow\n{\"base_url\":\"https://api.test.com\",\"steps\":[{\"name\":\"Health\",\"method\":\"GET\",\"url\":\"/health\"}]}\n```\n";
-        assert_semantic_roundtrip(md);
-        assert_idempotent(md);
-    }
-
-    #[test]
-    fn roundtrip_e2e_multi_step() {
-        let md = "```e2e alias=smoke displayMode=split\n{\"base_url\":\"https://api.test.com\",\"steps\":[{\"name\":\"Login\",\"method\":\"POST\",\"url\":\"/auth\"},{\"name\":\"Fetch\",\"method\":\"GET\",\"url\":\"/me\"},{\"name\":\"Logout\",\"method\":\"POST\",\"url\":\"/logout\"}]}\n```\n";
         assert_semantic_roundtrip(md);
         assert_idempotent(md);
     }

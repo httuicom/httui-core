@@ -7,7 +7,7 @@ use std::collections::HashMap;
 /// dispatch. The registry decouples the surface form from the executor key,
 /// letting new block types and dialects register without touching the runner.
 ///
-/// Defaults shipped with the core: `http`, `e2e`, and the `db` family
+/// Defaults shipped with the core: `http` and the `db` family
 /// (`db`, `db-postgres`, `db-mysql`, `db-sqlite` → `db`).
 pub struct BlockTypeRegistry {
     aliases: HashMap<String, String>,
@@ -25,7 +25,6 @@ impl BlockTypeRegistry {
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register_alias("http", "http");
-        r.register_alias("e2e", "e2e");
         r.register_alias("db", "db");
         r.register_alias("db-postgres", "db");
         r.register_alias("db-mysql", "db");
@@ -75,10 +74,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_passthrough_http_and_e2e() {
+    fn defaults_passthrough_http() {
         let r = BlockTypeRegistry::with_defaults();
         assert_eq!(r.canonicalize("http"), "http");
-        assert_eq!(r.canonicalize("e2e"), "e2e");
     }
 
     #[test]

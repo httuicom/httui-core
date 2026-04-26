@@ -14,7 +14,7 @@ pub struct ParsedBlock {
 
 /// Known executable block types.
 const EXECUTABLE_TYPES: &[&str] = &[
-    "http", "db", "db-postgres", "db-mysql", "db-sqlite", "e2e",
+    "http", "db", "db-postgres", "db-mysql", "db-sqlite",
 ];
 
 /// Parse all executable blocks from a markdown string.
@@ -22,7 +22,7 @@ const EXECUTABLE_TYPES: &[&str] = &[
 /// Scans for fenced code blocks with known executable types in the info string.
 ///
 /// Supported body formats per block type:
-/// - `http`, `e2e`: JSON body as before.
+/// - `http`: HTTP-message body (post-redesign) or legacy JSON shim.
 /// - `db-*`: heuristically detects legacy JSON body vs. raw SQL body.
 ///   - Legacy: body starts with `{` and parses as JSON containing a string `query` field.
 ///     `params` is the JSON as-is.
@@ -482,18 +482,6 @@ More text.
         assert_eq!(blocks[0].block_type, "db");
         assert_eq!(blocks[0].alias.as_deref(), Some("users"));
         assert_eq!(blocks[0].params["query"], "SELECT * FROM users");
-    }
-
-    #[test]
-    fn test_parse_e2e_block() {
-        let md = r#"```e2e alias=flow
-{"base_url":"https://api.test.com","steps":[{"name":"Step 1","method":"GET","url":"/health"}]}
-```
-"#;
-        let blocks = parse_blocks(md);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].block_type, "e2e");
-        assert_eq!(blocks[0].alias.as_deref(), Some("flow"));
     }
 
     #[test]
