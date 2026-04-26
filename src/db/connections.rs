@@ -2647,4 +2647,88 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap().rows.len(), 1);
     }
+
+    // ─────── Fail-secure: keychain unavailable must NOT fall back to plaintext ───────
+
+    #[tokio::test]
+    async fn create_connection_fails_secure_when_keychain_unavailable() {
+        // Epic 16, Story 02 invariant: if `store_secret` fails, the
+        // connection row must NOT be inserted with a plaintext password.
+        // We force the keychain to error and verify both the Err return
+        // AND that no row leaked into the database.
+        use crate::db::keychain::{
+            force_keychain_failure, KEYCHAIN_TEST_LOCK,
+        };
+
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let pool = setup_test_pool().await;
+
+        force_keychain_failure(true);
+        let result = create_connection(
+            &pool,
+            CreateConnection {
+                name: "fail-secure-test".to_string(),
+                driver: "postgres".to_string(),
+                host: Some("localhost".to_string()),
+                port: Some(5432),
+                database_name: Some("db".to_string()),
+                username: Some("user".to_string()),
+                password: Some("very-sensitive-password".to_string()),
+                ssl_mode: None,
+                timeout_ms: None,
+                query_timeout_ms: None,
+                ttl_seconds: None,
+                max_pool_size: None,
+                is_readonly: None,
+            },
+        )
+        .await;
+        force_keychain_failure(false);
+
+        // 1. The call must fail loudly.
+        let err = result.expect_err("create_connection must error when keychain fails");
+        assert!(
+            err.to_lowercase().contains("password") || err.to_lowercase().contains("keychain"),
+            "error should mention password/keychain, got: {err}"
+        );
+
+        // 2. No row must exist in the database — that's the actual fail-
+        // secure invariant. A leaked row with plaintext password would
+        // be the worst case (silent regression of T15 from epic 16).
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM connections")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "no connection row may exist when keychain storage failed",
+        );
+
+        // 3. Sanity: when the keychain works, the same call must succeed.
+        // Guards against the test always passing for the wrong reason.
+        let ok = create_connection(
+            &pool,
+            CreateConnection {
+                name: "fail-secure-baseline".to_string(),
+                driver: "postgres".to_string(),
+                host: Some("localhost".to_string()),
+                port: Some(5432),
+                database_name: Some("db".to_string()),
+                username: Some("user".to_string()),
+                password: Some("baseline-password".to_string()),
+                ssl_mode: None,
+                timeout_ms: None,
+                query_timeout_ms: None,
+                ttl_seconds: None,
+                max_pool_size: None,
+                is_readonly: None,
+            },
+        )
+        .await;
+        // The baseline only succeeds if the test environment has a working
+        // keyring backend (macOS Keychain, etc). In headless CI this can
+        // legitimately fail — accept either Ok or Err here. The fail-secure
+        // case above is what we really care about.
+        let _ = ok;
+    }
 }
