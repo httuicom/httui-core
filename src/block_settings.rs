@@ -124,6 +124,19 @@ pub async fn purge_settings(
     Ok(result.rows_affected())
 }
 
+/// Cascade-delete every settings row for a file. Called from the
+/// `delete_note` Tauri command when the host note is removed.
+pub async fn purge_settings_for_file(
+    pool: &SqlitePool,
+    file_path: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM block_settings WHERE file_path = ?")
+        .bind(file_path)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

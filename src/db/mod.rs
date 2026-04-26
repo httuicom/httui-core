@@ -22,6 +22,7 @@ const MIGRATION_007_SQL: &str = include_str!("../../migrations/007_connection_re
 const MIGRATION_008_SQL: &str = include_str!("../../migrations/008_sqlite_port_null.sql");
 const MIGRATION_009_SQL: &str = include_str!("../../migrations/009_block_run_history.sql");
 const MIGRATION_010_SQL: &str = include_str!("../../migrations/010_block_settings.sql");
+const MIGRATION_011_SQL: &str = include_str!("../../migrations/011_block_examples.sql");
 
 pub async fn init_db(app_data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
     std::fs::create_dir_all(app_data_dir).ok();
@@ -204,6 +205,14 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     // Onda 1: per-block settings (CREATE IF NOT EXISTS — idempotent)
     for statement in MIGRATION_010_SQL.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            sqlx::query(trimmed).execute(pool).await?;
+        }
+    }
+
+    // Onda 3: per-block pinned response examples (CREATE IF NOT EXISTS)
+    for statement in MIGRATION_011_SQL.split(';') {
         let trimmed = statement.trim();
         if !trimmed.is_empty() {
             sqlx::query(trimmed).execute(pool).await?;

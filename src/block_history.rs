@@ -12,7 +12,25 @@
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-const HISTORY_CAP: i64 = 10;
+const DEFAULT_HISTORY_CAP: i64 = 10;
+const RETENTION_KEY: &str = "history_retention";
+
+/// Read the user-configured history retention from `app_config`, falling
+/// back to the default. Values <= 0 are treated as the default — to fully
+/// disable history the per-block `history_disabled` flag is the right
+/// switch (Onda 1).
+async fn get_retention(pool: &SqlitePool) -> i64 {
+    let row: Option<String> = sqlx::query_scalar("SELECT value FROM app_config WHERE key = ?")
+        .bind(RETENTION_KEY)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    match row.and_then(|s| s.parse::<i64>().ok()) {
+        Some(n) if n > 0 => n,
+        _ => DEFAULT_HISTORY_CAP,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -68,7 +86,8 @@ pub async fn insert_history_entry(
     .execute(pool)
     .await?;
 
-    // Trim: keep the most recent HISTORY_CAP rows for this block.
+    // Trim to the retention cap (user-configurable via app_config; default 10).
+    let cap = get_retention(pool).await;
     sqlx::query(
         "DELETE FROM block_run_history
          WHERE file_path = ? AND block_alias = ?
@@ -83,7 +102,7 @@ pub async fn insert_history_entry(
     .bind(&entry.block_alias)
     .bind(&entry.file_path)
     .bind(&entry.block_alias)
-    .bind(HISTORY_CAP)
+    .bind(cap)
     .execute(pool)
     .await?;
 
@@ -118,7 +137,7 @@ pub async fn list_history(
     )
     .bind(file_path)
     .bind(block_alias)
-    .bind(HISTORY_CAP)
+    .bind(get_retention(pool).await)
     .fetch_all(pool)
     .await?;
 
@@ -154,6 +173,19 @@ pub async fn purge_history(
     .bind(block_alias)
     .execute(pool)
     .await?;
+    Ok(result.rows_affected())
+}
+
+/// Cascade-delete every history row for a file. Called from the
+/// `delete_note` Tauri command when the host note is removed.
+pub async fn purge_history_for_file(
+    pool: &SqlitePool,
+    file_path: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM block_run_history WHERE file_path = ?")
+        .bind(file_path)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -226,7 +258,7 @@ mod tests {
                 .unwrap();
         }
         let rows = list_history(&pool, "/notes/test.md", "req1").await.unwrap();
-        assert_eq!(rows.len(), HISTORY_CAP as usize);
+        assert_eq!(rows.len(), DEFAULT_HISTORY_CAP as usize);
         // Newest 10 should be statuses 205..=214.
         let statuses: Vec<i64> = rows.iter().map(|r| r.status.unwrap()).collect();
         assert_eq!(statuses[0], 214);
