@@ -19,9 +19,15 @@ use serde::{Deserialize, Serialize};
 
 /// Per-execution timing breakdown.
 ///
-/// V1 ships `total_ms` only — sub-fields stay `None` until a reqwest
-/// middleware exposes connect/TLS/TTFB hooks. Consumers should treat
-/// missing fields as "unknown", not "zero".
+/// V1 ships `total_ms` + `ttfb_ms` (split before/after `req.send()` returns
+/// headers). Sub-fields `dns_ms`/`connect_ms`/`tls_ms` stay `None` — they
+/// require swapping `reqwest` for `isahc`/libcurl, deferred to V2 (see
+/// `docs/http-timing-isahc-future.md`). Consumers should treat missing
+/// fields as "unknown", not "zero".
+///
+/// `connection_reused` is always `false` in V1 — without a custom connector
+/// we can't tell pool-hits apart from cold connects with confidence. Lands
+/// in V2 alongside the isahc swap.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TimingBreakdown {
     pub total_ms: u64,
@@ -33,6 +39,8 @@ pub struct TimingBreakdown {
     pub tls_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttfb_ms: Option<u64>,
+    #[serde(default)]
+    pub connection_reused: bool,
 }
 
 /// A cookie captured from a `Set-Cookie` response header.
@@ -76,14 +84,34 @@ pub struct HttpResponse {
 
 /// Streaming chunk emitted to a `tauri::Channel<HttpChunk>` during execution.
 ///
-/// V1 ships the minimal cancel-aware variants (mirror of `DbChunk`). Richer
-/// streaming variants (`Headers`, `BodyChunk`) are reserved for a follow-up
-/// stage that consumes reqwest's body stream incrementally.
+/// Wire order on a successful execution:
+///   `Headers { ... }` → `BodyChunk { ... }` × N → `Complete(HttpResponse)`
+/// On failure / cancel: a single terminal `Error` / `Cancelled` after any
+/// `Headers`/`BodyChunk` already emitted (cancel mid-body discards the
+/// partial body — frontend should treat `Cancelled` as "no result").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HttpChunk {
+    /// First chunk: status + headers as soon as `req.send()` returns.
+    /// `ttfb_ms` is the elapsed time between dispatching the request and
+    /// receiving the response headers (= Postman-style "Time to First Byte").
+    /// Frontend can update statusbar dot + status text immediately.
+    Headers {
+        status_code: u16,
+        status_text: String,
+        headers: std::collections::HashMap<String, String>,
+        ttfb_ms: u64,
+    },
+    /// Body chunk(s) emitted as `bytes_stream()` yields. `offset` is the
+    /// total bytes received before this chunk (so receivers can verify
+    /// continuity). V1 frontend ignores these except for a "downloading
+    /// X kb…" progress counter — `Complete` carries the consolidated body.
+    BodyChunk {
+        offset: u64,
+        bytes: Vec<u8>,
+    },
     /// Terminal chunk containing the full response. Consumer should close
-    /// the subscription after receiving this.
+    /// the subscription after receiving this. The cache writes from this.
     Complete(HttpResponse),
     /// Terminal chunk indicating the execution failed before completing.
     Error { message: String },
@@ -222,5 +250,38 @@ mod tests {
         assert_eq!(v["total_ms"], 0);
         assert!(v.get("dns_ms").is_none());
         assert!(v.get("connect_ms").is_none());
+        // connection_reused is not Option — always present, defaults to false.
+        assert_eq!(v["connection_reused"], false);
+    }
+
+    #[test]
+    fn http_chunk_headers_serializes() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let chunk = HttpChunk::Headers {
+            status_code: 200,
+            status_text: "OK".to_string(),
+            headers,
+            ttfb_ms: 42,
+        };
+        let v = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(v["kind"], "headers");
+        assert_eq!(v["status_code"], 200);
+        assert_eq!(v["status_text"], "OK");
+        assert_eq!(v["ttfb_ms"], 42);
+        assert_eq!(v["headers"]["content-type"], "application/json");
+    }
+
+    #[test]
+    fn http_chunk_body_chunk_serializes() {
+        let chunk = HttpChunk::BodyChunk {
+            offset: 8,
+            bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let v = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(v["kind"], "body_chunk");
+        assert_eq!(v["offset"], 8);
+        // serde_json serializes Vec<u8> as a JSON array of numbers.
+        assert_eq!(v["bytes"], serde_json::json!([0xDE, 0xAD, 0xBE, 0xEF]));
     }
 }

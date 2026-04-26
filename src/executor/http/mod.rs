@@ -2,6 +2,7 @@ pub mod types;
 
 use async_trait::async_trait;
 use base64::prelude::*;
+use futures_util::StreamExt;
 use reqwest::redirect::Policy;
 use reqwest::Client;
 use serde::Deserialize;
@@ -10,6 +11,14 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+use self::types::HttpChunk;
+
+/// Hard cap on response body size. Above this, the executor returns a
+/// `[body_too_large]` error before reading further bytes. Streaming via
+/// `bytes_stream()` keeps memory bounded along the way — the cap exists so
+/// a single accidental download can't fill the whole webview heap.
+const MAX_BODY_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 
 use self::types::{parse_set_cookie, Cookie, HttpResponse, TimingBreakdown};
 use super::{BlockResult, Executor, ExecutorError};
@@ -140,20 +149,43 @@ impl HttpExecutor {
 
     /// Cancel-aware execution returning the typed `HttpResponse` directly.
     ///
-    /// The `cancel` token is observed via `tokio::select!`. When fired, the
-    /// in-flight request future is dropped and the caller gets a cancellation
-    /// error. Reqwest does not propagate cancellation to the server (the
-    /// remote endpoint may continue processing); the local connection is
-    /// simply released.
-    ///
-    /// This path always returns the typed shape; HTTP-level errors (4xx/5xx)
-    /// are surfaced as `Ok(response)` with the status code preserved — only
+    /// Wraps `execute_streamed` with a no-op chunk callback for callers that
+    /// don't care about progress (legacy `execute()` Tauri path, internal
+    /// uses, tests). The `cancel` token semantics are unchanged: when fired,
+    /// the in-flight request or body stream future is dropped and the caller
+    /// gets `Err("Request cancelled")`. HTTP-level errors (4xx/5xx) are
+    /// surfaced as `Ok(response)` with the status code preserved — only
     /// transport/encoding/cancellation failures map to `Err`.
     pub async fn execute_with_cancel(
         &self,
         params: serde_json::Value,
         cancel: CancellationToken,
     ) -> Result<HttpResponse, ExecutorError> {
+        self.execute_streamed(params, cancel, |_| {}).await
+    }
+
+    /// Streaming, cancel-aware execution. Emits `HttpChunk::Headers` once
+    /// the response status line is available, then `HttpChunk::BodyChunk`
+    /// per body chunk yielded by `Response::bytes_stream()`, and finally
+    /// `HttpChunk::Complete(response)` with the consolidated body.
+    ///
+    /// Memory bound: total accumulated body is capped at `MAX_BODY_BYTES`
+    /// (100 MB). Above that, the executor returns a `[body_too_large]`
+    /// error and stops reading further bytes — no `Complete` is emitted.
+    ///
+    /// Cancel mid-body returns `Err("Request cancelled")` and emits no
+    /// terminal chunk on the callback (the `executions.rs` Tauri command
+    /// converts this `Err` into a `HttpChunk::Cancelled` on the wire).
+    /// Partial bytes received before the cancel are discarded.
+    pub async fn execute_streamed<F>(
+        &self,
+        params: serde_json::Value,
+        cancel: CancellationToken,
+        on_chunk: F,
+    ) -> Result<HttpResponse, ExecutorError>
+    where
+        F: Fn(HttpChunk) + Send,
+    {
         let p: HttpParams = serde_json::from_value(params)
             .map_err(|e| ExecutorError(format!("Invalid params: {e}")))?;
         let flags = ClientFlags {
@@ -163,7 +195,7 @@ impl HttpExecutor {
         let client = self.client_for(flags);
         let req = build_request(&client, &p, &cancel).await?;
 
-        let start = Instant::now();
+        let t0 = Instant::now();
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -175,42 +207,120 @@ impl HttpExecutor {
                 })?
             }
         };
+        let ttfb_ms = t0.elapsed().as_millis() as u64;
 
-        let bytes_future = collect_response(response);
-        let collected = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                return Err(ExecutorError("Request cancelled".to_string()));
+        // Headers + cookies + content-type captured up-front so the partial
+        // shape is stable and we don't re-borrow `response` after starting
+        // the body stream.
+        let status_code = response.status().as_u16();
+        let status_text = response
+            .status()
+            .canonical_reason()
+            .unwrap_or("")
+            .to_string();
+        let cookies: Vec<Cookie> = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter_map(parse_set_cookie)
+            .collect();
+        let resp_headers: HashMap<String, String> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let content_type = resp_headers
+            .get("content-type")
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        on_chunk(HttpChunk::Headers {
+            status_code,
+            status_text: status_text.clone(),
+            headers: resp_headers.clone(),
+            ttfb_ms,
+        });
+
+        // Stream the body in chunks. We accumulate into `body_bytes` so the
+        // terminal `Complete` carries the consolidated payload (the cache
+        // and the body viewer both want a single value, not a stream of
+        // chunks). The cap fires before we copy into `body_bytes`, so a
+        // pathological response can grow `body_bytes` to at most
+        // `MAX_BODY_BYTES + last_chunk_size` (chunks from reqwest are
+        // typically ≤ 16 KB).
+        let mut stream = response.bytes_stream();
+        let mut body_bytes: Vec<u8> = Vec::with_capacity(8 * 1024);
+        let mut offset: u64 = 0;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(ExecutorError("Request cancelled".to_string()));
+                }
+                next = stream.next() => {
+                    match next {
+                        None => break,
+                        Some(Err(e)) => {
+                            return Err(ExecutorError(format!(
+                                "[{}] {}",
+                                classify_reqwest_error(&e),
+                                e
+                            )));
+                        }
+                        Some(Ok(bytes)) => {
+                            let new_total = offset + bytes.len() as u64;
+                            if new_total > MAX_BODY_BYTES {
+                                return Err(ExecutorError(format!(
+                                    "[body_too_large] response exceeded {} MB cap",
+                                    MAX_BODY_BYTES / 1024 / 1024
+                                )));
+                            }
+                            let chunk_vec = bytes.to_vec();
+                            body_bytes.extend_from_slice(&chunk_vec);
+                            on_chunk(HttpChunk::BodyChunk {
+                                offset,
+                                bytes: chunk_vec,
+                            });
+                            offset = new_total;
+                        }
+                    }
+                }
             }
-            res = bytes_future => res?,
+        }
+
+        let size_bytes = body_bytes.len() as u64;
+        let body_value = if is_binary_content_type(&content_type) {
+            serde_json::json!({
+                "encoding": "base64",
+                "data": BASE64_STANDARD.encode(&body_bytes),
+            })
+        } else {
+            let text = String::from_utf8_lossy(&body_bytes).into_owned();
+            serde_json::from_str::<serde_json::Value>(&text)
+                .unwrap_or_else(|_| serde_json::Value::String(text))
         };
 
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        Ok(HttpResponse {
-            status_code: collected.status_code,
-            status_text: collected.status_text,
-            headers: collected.headers,
-            body: collected.body,
-            size_bytes: collected.size_bytes,
-            elapsed_ms,
+        let total_ms = t0.elapsed().as_millis() as u64;
+        let response = HttpResponse {
+            status_code,
+            status_text,
+            headers: resp_headers,
+            body: body_value,
+            size_bytes,
+            elapsed_ms: total_ms,
             timing: TimingBreakdown {
-                total_ms: elapsed_ms,
+                total_ms,
+                ttfb_ms: Some(ttfb_ms),
+                connection_reused: false,
                 ..Default::default()
             },
-            cookies: collected.cookies,
-        })
+            cookies,
+        };
+        on_chunk(HttpChunk::Complete(response.clone()));
+        Ok(response)
     }
-}
-
-/// Internal collected response shape — `execute_with_cancel` adds timing on
-/// top and converts to the public `HttpResponse`.
-struct CollectedResponse {
-    status_code: u16,
-    status_text: String,
-    headers: HashMap<String, String>,
-    body: serde_json::Value,
-    size_bytes: u64,
-    cookies: Vec<Cookie>,
 }
 
 async fn build_request(
@@ -569,63 +679,6 @@ async fn read_file_with_cancel(
             ExecutorError(format!("Read body file {}: {e}", path.display()))
         }),
     }
-}
-
-async fn collect_response(
-    response: reqwest::Response,
-) -> Result<CollectedResponse, ExecutorError> {
-    let status_code = response.status().as_u16();
-    let status_text = response
-        .status()
-        .canonical_reason()
-        .unwrap_or("")
-        .to_string();
-
-    // Capture Set-Cookie headers BEFORE moving the response into bytes().
-    let cookies: Vec<Cookie> = response
-        .headers()
-        .get_all(reqwest::header::SET_COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .filter_map(parse_set_cookie)
-        .collect();
-
-    let resp_headers: HashMap<String, String> = response
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
-
-    let content_type = resp_headers
-        .get("content-type")
-        .map(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let bytes = response.bytes().await.map_err(|e| {
-        ExecutorError(format!("[{}] {}", classify_reqwest_error(&e), e))
-    })?;
-    let size_bytes = bytes.len() as u64;
-
-    let body_value = if is_binary_content_type(&content_type) {
-        serde_json::json!({
-            "encoding": "base64",
-            "data": BASE64_STANDARD.encode(&bytes),
-        })
-    } else {
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        serde_json::from_str::<serde_json::Value>(&text)
-            .unwrap_or_else(|_| serde_json::Value::String(text))
-    };
-
-    Ok(CollectedResponse {
-        status_code,
-        status_text,
-        headers: resp_headers,
-        body: body_value,
-        size_bytes,
-        cookies,
-    })
 }
 
 #[async_trait]
@@ -1356,5 +1409,281 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Read body file"), "got: {err}");
+    }
+
+    // ─────────── Onda 4 — streaming + ttfb + body cap ───────────
+
+    /// Capture all chunks emitted on the callback. Returned `Arc<Mutex<Vec>>`
+    /// is shared with the closure passed to `execute_streamed`.
+    fn capture_chunks() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<HttpChunk>>>,
+        impl Fn(HttpChunk) + Send,
+    ) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<HttpChunk>::new()));
+        let buf_clone = buf.clone();
+        let cb = move |chunk: HttpChunk| {
+            buf_clone.lock().unwrap().push(chunk);
+        };
+        (buf, cb)
+    }
+
+    fn count_kinds(chunks: &[HttpChunk]) -> (usize, usize, usize, usize, usize) {
+        let mut h = 0;
+        let mut b = 0;
+        let mut c = 0;
+        let mut e = 0;
+        let mut x = 0;
+        for ch in chunks {
+            match ch {
+                HttpChunk::Headers { .. } => h += 1,
+                HttpChunk::BodyChunk { .. } => b += 1,
+                HttpChunk::Complete(_) => c += 1,
+                HttpChunk::Error { .. } => e += 1,
+                HttpChunk::Cancelled => x += 1,
+            }
+        }
+        (h, b, c, e, x)
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_headers_then_body_then_complete() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/stream"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("hello world"),
+            )
+            .mount(&server)
+            .await;
+
+        let executor = HttpExecutor::new();
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/stream", server.uri()),
+        });
+        let (buf, cb) = capture_chunks();
+        let result = executor
+            .execute_streamed(params, CancellationToken::new(), cb)
+            .await
+            .expect("streamed execution should succeed");
+
+        assert_eq!(result.status_code, 200);
+        let chunks = buf.lock().unwrap();
+        let (h, b, c, e, x) = count_kinds(&chunks);
+        assert_eq!(h, 1, "exactly one Headers chunk");
+        assert!(b >= 1, "at least one BodyChunk (got {b})");
+        assert_eq!(c, 1, "exactly one Complete chunk");
+        assert_eq!(e, 0);
+        assert_eq!(x, 0);
+        // First chunk MUST be Headers, last MUST be Complete.
+        assert!(matches!(chunks.first(), Some(HttpChunk::Headers { .. })));
+        assert!(matches!(chunks.last(), Some(HttpChunk::Complete(_))));
+    }
+
+    #[tokio::test]
+    async fn streaming_handles_large_body_without_oom() {
+        // 10 MB response — well under the 100 MB cap. Verifies that the
+        // bytes_stream loop completes and that BodyChunk offsets cover the
+        // whole payload.
+        let server = MockServer::start().await;
+        let payload: Vec<u8> = vec![0xAB; 10 * 1024 * 1024];
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(payload.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let executor = HttpExecutor::new();
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/big", server.uri()),
+        });
+        let (buf, cb) = capture_chunks();
+        let result = executor
+            .execute_streamed(params, CancellationToken::new(), cb)
+            .await
+            .expect("10MB streaming should succeed");
+
+        assert_eq!(result.status_code, 200);
+        assert_eq!(result.size_bytes, 10 * 1024 * 1024);
+
+        // Sum of BodyChunk byte lengths must equal the total payload.
+        let chunks = buf.lock().unwrap();
+        let body_total: usize = chunks
+            .iter()
+            .filter_map(|c| match c {
+                HttpChunk::BodyChunk { bytes, .. } => Some(bytes.len()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(body_total, 10 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn streaming_enforces_body_cap() {
+        // 100 MB + 1 byte payload — exceeds the cap by 1 byte. Validates
+        // that the executor returns the typed `[body_too_large]` error and
+        // does NOT emit a Complete chunk on the channel.
+        let server = MockServer::start().await;
+        let payload: Vec<u8> = vec![0u8; (100 * 1024 * 1024) + 1];
+        Mock::given(method("GET"))
+            .and(path("/over"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(payload),
+            )
+            .mount(&server)
+            .await;
+
+        let executor = HttpExecutor::new();
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/over", server.uri()),
+        });
+        let (buf, cb) = capture_chunks();
+        let result = executor
+            .execute_streamed(params, CancellationToken::new(), cb)
+            .await;
+
+        let err = result.expect_err("oversized body must error").to_string();
+        assert!(
+            err.contains("[body_too_large]"),
+            "expected body_too_large classification, got: {err}"
+        );
+        let chunks = buf.lock().unwrap();
+        let (_h, _b, c, _e, _x) = count_kinds(&chunks);
+        assert_eq!(c, 0, "Complete must NOT be emitted when cap fires");
+    }
+
+    #[tokio::test]
+    async fn streaming_cancel_mid_body_emits_no_complete() {
+        // Slow-trickle response — the response delay holds the body before
+        // it streams, giving us a window to cancel mid-flight. The cancel
+        // future fires before the body finishes, and the executor returns
+        // `Err("Request cancelled")`. No Complete chunk should appear on
+        // the callback.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow-body"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(500))
+                    .set_body_bytes(vec![0u8; 4 * 1024 * 1024]),
+            )
+            .mount(&server)
+            .await;
+
+        let executor = HttpExecutor::new();
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/slow-body", server.uri()),
+        });
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            token_clone.cancel();
+        });
+
+        let (buf, cb) = capture_chunks();
+        let result = executor.execute_streamed(params, token, cb).await;
+        let err = result.expect_err("cancel must surface as error").to_string();
+        assert_eq!(err, "Request cancelled");
+
+        let chunks = buf.lock().unwrap();
+        let (_h, _b, c, _e, _x) = count_kinds(&chunks);
+        assert_eq!(c, 0, "Complete must NOT be emitted on cancel");
+    }
+
+    #[tokio::test]
+    async fn ttfb_is_less_than_or_equal_to_total() {
+        // Wiremock honors the per-request delay before sending the response,
+        // so TTFB picks up at least ~50ms. Total includes TTFB + body
+        // streaming, so the ≤ relation must hold.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/timed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(50))
+                    .set_body_string("ok"),
+            )
+            .mount(&server)
+            .await;
+
+        let executor = HttpExecutor::new();
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": format!("{}/timed", server.uri()),
+        });
+        let (buf, cb) = capture_chunks();
+        let response = executor
+            .execute_streamed(params, CancellationToken::new(), cb)
+            .await
+            .unwrap();
+
+        let chunks = buf.lock().unwrap();
+        let header_ttfb = chunks
+            .iter()
+            .find_map(|c| match c {
+                HttpChunk::Headers { ttfb_ms, .. } => Some(*ttfb_ms),
+                _ => None,
+            })
+            .expect("Headers chunk must carry ttfb_ms");
+
+        assert!(
+            header_ttfb <= response.timing.total_ms,
+            "ttfb_ms ({}) > total_ms ({})",
+            header_ttfb,
+            response.timing.total_ms,
+        );
+        assert_eq!(
+            response.timing.ttfb_ms,
+            Some(header_ttfb),
+            "TimingBreakdown.ttfb_ms must match the Headers chunk value",
+        );
+        // V1 invariant — sub-fields stay None.
+        assert_eq!(response.timing.dns_ms, None);
+        assert_eq!(response.timing.connect_ms, None);
+        assert_eq!(response.timing.tls_ms, None);
+        assert!(!response.timing.connection_reused);
+    }
+
+    #[tokio::test]
+    async fn streaming_legacy_execute_with_cancel_still_works() {
+        // The legacy entry point now wraps execute_streamed with a no-op
+        // callback. Behaviour for callers (legacy `execute()` Tauri command,
+        // existing tests) must be byte-for-byte identical aside from the
+        // newly populated `ttfb_ms` field.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/legacy"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"ok": true})),
+            )
+            .mount(&server)
+            .await;
+
+        let executor = HttpExecutor::new();
+        let params = serde_json::json!({
+            "method": "POST",
+            "url": format!("{}/legacy", server.uri()),
+            "body": "{}",
+        });
+        let response = executor
+            .execute_with_cancel(params, CancellationToken::new())
+            .await
+            .expect("legacy entry point must keep working");
+
+        assert_eq!(response.status_code, 201);
+        assert_eq!(response.body["ok"], true);
+        assert_eq!(response.timing.total_ms, response.elapsed_ms);
+        assert!(response.timing.ttfb_ms.is_some(), "Onda 4 fills ttfb");
     }
 }
