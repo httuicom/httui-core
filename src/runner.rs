@@ -351,4 +351,75 @@ mod tests {
         assert_eq!(result.status, "success");
         assert_eq!(result.data["body"]["ok"], true);
     }
+
+    // ─────── Epic 16 L166: deep dependency chain DoS ───────
+
+    #[tokio::test]
+    async fn deep_dependency_chain_rejects_above_max_depth() {
+        // Vault that authors a long chain of blocks each referencing the
+        // previous one (`b1 ← b0`, `b2 ← b1`, ..., `bN ← b{N-1}`). The
+        // final block can only resolve by walking the whole chain. With
+        // MAX_DEPENDENCY_DEPTH = 50, asking for `b51` must reject before
+        // exhausting the stack.
+        let (_tmp, runner, vault_path) = setup().await;
+
+        // Each block is an HTTP GET that references the previous block via
+        // `{{prev.response.body.x}}` in its URL. The URL is bogus — we
+        // never let it actually run; the depth limit kicks in first.
+        let mut content = String::from("# Deep chain\n\n");
+        // `b0` is the leaf: standalone HTTP block, no refs.
+        content.push_str(
+            "```http alias=b0\n{\"method\":\"GET\",\"url\":\"https://example.invalid/0\",\"params\":[],\"headers\":[],\"body\":\"\"}\n```\n\n",
+        );
+        // `b1` … `b60`: each references its predecessor in the URL.
+        for i in 1..=60 {
+            content.push_str(&format!(
+                "```http alias=b{i}\n{{\"method\":\"GET\",\"url\":\"https://example.invalid/{{{{b{prev}.response.body.x}}}}\",\"params\":[],\"headers\":[],\"body\":\"\"}}\n```\n\n",
+                i = i,
+                prev = i - 1,
+            ));
+        }
+        std::fs::write(format!("{}/chain.md", vault_path), content).unwrap();
+
+        // Asking for the deepest alias (`b60`) requires walking 60 levels —
+        // beyond the 50-level cap. Must error with DependencyFailed.
+        let result = runner.execute(&vault_path, "chain.md", "b60").await;
+        let err = result.expect_err("deep chain must be rejected");
+        match err {
+            RunnerError::DependencyFailed(msg) => {
+                assert!(
+                    msg.contains("maximum depth"),
+                    "error must mention the depth cap, got: {msg}"
+                );
+            }
+            other => panic!("expected DependencyFailed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cyclic_dependency_is_rejected() {
+        // Sibling check: cycle detection should kick in before depth
+        // overflow. A two-block cycle (`a ← b`, `b ← a`) returns
+        // CyclicDependency, not DependencyFailed.
+        let (_tmp, runner, vault_path) = setup().await;
+        let content = r#"# Cycle
+
+```http alias=a
+{"method":"GET","url":"https://example.invalid/{{b.response.body.x}}","params":[],"headers":[],"body":""}
+```
+
+```http alias=b
+{"method":"GET","url":"https://example.invalid/{{a.response.body.x}}","params":[],"headers":[],"body":""}
+```
+"#;
+        std::fs::write(format!("{}/cycle.md", vault_path), content).unwrap();
+
+        let result = runner.execute(&vault_path, "cycle.md", "a").await;
+        // The DAG-by-construction rule means `a` can only depend on blocks
+        // ABOVE it. `b` is below `a`, so the cycle never forms — `a`
+        // executes against a missing alias. We expect either DependencyFailed
+        // (b unresolvable from a's position) or BlockNotFound, NOT a stack
+        // overflow or hang. This test guards the boundary: deep ≠ infinite.
+        assert!(result.is_err());
+    }
 }

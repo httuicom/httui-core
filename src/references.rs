@@ -314,4 +314,45 @@ mod tests {
         let resolved = resolve_all(&params, &HashMap::new(), &HashMap::new());
         assert_eq!(resolved["url"], "{{UNKNOWN}}/api");
     }
+
+    // ─────── Epic 16 L166: prototype pollution defense ───────
+
+    #[test]
+    fn navigate_json_blocks_prototype_pollution_keys() {
+        // Even if the response payload literally contains a key called
+        // `__proto__` (or `constructor` / `prototype`), references that
+        // try to navigate into it must return None — never the value.
+        // Mitigates a vault that authors `{{login.response.__proto__}}`
+        // assuming Rust JSON behaves like JS prototype-walked objects.
+        let value = serde_json::json!({
+            "response": {
+                "__proto__": "should-not-be-readable",
+                "constructor": "ditto",
+                "prototype": "ditto",
+                "safe_key": "ok",
+            }
+        });
+
+        assert_eq!(
+            navigate_json(&value, "response.__proto__"),
+            None,
+            "__proto__ must be blocked even when present in payload",
+        );
+        assert_eq!(navigate_json(&value, "response.constructor"), None);
+        assert_eq!(navigate_json(&value, "response.prototype"), None);
+        // Sanity: regular keys still resolve.
+        assert_eq!(
+            navigate_json(&value, "response.safe_key"),
+            Some(serde_json::json!("ok")),
+        );
+    }
+
+    #[test]
+    fn navigate_json_blocks_prototype_pollution_mid_path() {
+        // Mid-path: the dangerous key is not the leaf.
+        let value = serde_json::json!({
+            "__proto__": { "leaked": "value" }
+        });
+        assert_eq!(navigate_json(&value, "__proto__.leaked"), None);
+    }
 }
