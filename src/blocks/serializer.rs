@@ -18,6 +18,8 @@ use crate::blocks::parser::ParsedBlock;
 pub fn serialize_block(block: &ParsedBlock) -> String {
     if is_db_block(&block.block_type) {
         serialize_db_block(block)
+    } else if block.block_type == "http" {
+        serialize_http_block(block)
     } else {
         serialize_json_block(block)
     }
@@ -25,6 +27,131 @@ pub fn serialize_block(block: &ParsedBlock) -> String {
 
 fn is_db_block(block_type: &str) -> bool {
     block_type == "db" || block_type.starts_with("db-")
+}
+
+/// Serialize an http block in canonical HTTP-message form. Mirrors
+/// the desktop/CodeMirror writer in `src/lib/blocks/http-fence.ts`:
+///
+/// - Line 1: `<METHOD> <URL>` with query params re-attached as
+///   `?key=value&key=value` (URL-encoded values).
+/// - One line per header: `Name: value`.
+/// - Blank line, then the request body, when the body is non-empty.
+///
+/// The legacy JSON-body shape is still accepted by the parser (round-
+/// trip via `parse_legacy_http_body`), so existing vaults keep
+/// opening; new saves all use the canonical form.
+fn serialize_http_block(block: &ParsedBlock) -> String {
+    let mut info = block.block_type.clone();
+    if let Some(alias) = block.alias.as_deref().filter(|s| !s.is_empty()) {
+        info.push_str(" alias=");
+        info.push_str(alias);
+    }
+    if let Some(display) = block.display_mode.as_deref().filter(|s| !s.is_empty()) {
+        info.push_str(" displayMode=");
+        info.push_str(display);
+    }
+
+    let params = block.params.as_object();
+    let method = params
+        .and_then(|o| o.get("method"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("GET")
+        .to_uppercase();
+    let url = params
+        .and_then(|o| o.get("url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let query = params
+        .and_then(|o| o.get("params"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.as_slice())
+        .unwrap_or(&[]);
+    let headers = params
+        .and_then(|o| o.get("headers"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.as_slice())
+        .unwrap_or(&[]);
+    let body = params
+        .and_then(|o| o.get("body"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Build the request line: METHOD URL?key=value&key=value.
+    let mut request_line = String::new();
+    request_line.push_str(&method);
+    request_line.push(' ');
+    request_line.push_str(url);
+    let query_string = build_query_string(query);
+    if !query_string.is_empty() {
+        // Append `?` only when the URL doesn't already carry one;
+        // otherwise the params extend an existing query (`&`).
+        let sep = if url.contains('?') { '&' } else { '?' };
+        request_line.push(sep);
+        request_line.push_str(&query_string);
+    }
+
+    // Headers: one per line, in insertion order.
+    let mut header_lines = String::new();
+    for h in headers {
+        let key = h.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        let value = h.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        if key.is_empty() {
+            continue;
+        }
+        header_lines.push('\n');
+        header_lines.push_str(key);
+        header_lines.push_str(": ");
+        header_lines.push_str(value);
+    }
+
+    let mut body_block = String::new();
+    let trimmed_body = body.trim_end_matches('\n');
+    if !trimmed_body.is_empty() {
+        // Blank separator before the body, mirroring the HTTP wire
+        // format. The body itself preserves whatever the user wrote
+        // — JSON, form-data, multipart, plain text — without
+        // re-encoding.
+        body_block.push_str("\n\n");
+        body_block.push_str(trimmed_body);
+    }
+
+    format!("```{info}\n{request_line}{header_lines}{body_block}\n```")
+}
+
+/// URL-encode a value for the query string. Mirrors JavaScript's
+/// `encodeURIComponent` — keeps the unreserved set intact, percent-
+/// encodes everything else.
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        let keep = matches!(
+            b,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~'
+            | b'!' | b'*' | b'\'' | b'(' | b')'
+        );
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+/// Render a query-param array as `k1=v1&k2=v2`. Empty keys are
+/// dropped (same as the parser's behavior on the read path).
+fn build_query_string(params: &[serde_json::Value]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(params.len());
+    for p in params {
+        let key = p.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        if key.is_empty() {
+            continue;
+        }
+        let value = p.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        parts.push(format!("{}={}", percent_encode_query(key), percent_encode_query(value)));
+    }
+    parts.join("&")
 }
 
 fn serialize_db_block(block: &ParsedBlock) -> String {
@@ -196,6 +323,77 @@ mod tests {
             out,
             "```db-postgres alias=u connection=x timeout=5000\nSELECT 1\n```"
         );
+    }
+
+    // ─── HTTP canonical form (HTTP-message body) ───
+
+    #[test]
+    fn http_emits_request_line_with_method_and_url() {
+        let parsed = parse_blocks(
+            "```http alias=h\nGET https://example.com/users\n```\n",
+        );
+        let out = serialize_block(&parsed[0]);
+        assert_eq!(
+            out,
+            "```http alias=h\nGET https://example.com/users\n```",
+        );
+    }
+
+    #[test]
+    fn http_emits_headers_one_per_line() {
+        let parsed = parse_blocks(
+            "```http alias=h\nGET https://example.com/u\nAuthorization: Bearer abc\nAccept: application/json\n```\n",
+        );
+        let out = serialize_block(&parsed[0]);
+        assert_eq!(
+            out,
+            "```http alias=h\nGET https://example.com/u\nAuthorization: Bearer abc\nAccept: application/json\n```",
+        );
+    }
+
+    #[test]
+    fn http_emits_body_after_blank_separator() {
+        let parsed = parse_blocks(
+            "```http alias=h\nPOST https://example.com/u\nContent-Type: application/json\n\n{\"name\":\"alice\"}\n```\n",
+        );
+        let out = serialize_block(&parsed[0]);
+        assert_eq!(
+            out,
+            "```http alias=h\nPOST https://example.com/u\nContent-Type: application/json\n\n{\"name\":\"alice\"}\n```",
+        );
+    }
+
+    #[test]
+    fn http_legacy_json_body_normalizes_to_http_message_form() {
+        // Legacy JSON shape (pre-redesign) must serialize as the new
+        // HTTP-message canonical form, just like DB blocks normalize
+        // their legacy JSON bodies to raw SQL.
+        let parsed = parse_blocks(
+            "```http alias=u\n{\"method\":\"POST\",\"url\":\"https://api.test.com/login\",\"params\":[],\"headers\":[{\"key\":\"Accept\",\"value\":\"application/json\"}],\"body\":\"{\\\"u\\\":1}\"}\n```\n",
+        );
+        let out = serialize_block(&parsed[0]);
+        assert_eq!(
+            out,
+            "```http alias=u\nPOST https://api.test.com/login\nAccept: application/json\n\n{\"u\":1}\n```",
+        );
+    }
+
+    #[test]
+    fn http_query_params_appended_url_encoded() {
+        // Legacy JSON body with structured `params` array. The
+        // serializer must inline them onto the URL with `?k=v&...`,
+        // url-encoding values that contain reserved characters.
+        let parsed = parse_blocks(
+            "```http alias=q\n{\"method\":\"GET\",\"url\":\"https://api.test.com/search\",\"params\":[{\"key\":\"q\",\"value\":\"hello world\"},{\"key\":\"page\",\"value\":\"2\"}],\"headers\":[],\"body\":\"\"}\n```\n",
+        );
+        let out = serialize_block(&parsed[0]);
+        assert!(
+            out.contains("?q=hello%20world&page=2"),
+            "expected url-encoded query string in output, got: {out}",
+        );
+        // Re-parse round-trips: the structural URL is preserved.
+        let reparsed = parse_blocks(&out);
+        assert_eq!(reparsed.len(), 1);
     }
 
     // ─── Forward-compat for unknown types ───
