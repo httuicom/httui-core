@@ -118,29 +118,14 @@ fn serialize_http_block(block: &ParsedBlock) -> String {
     format!("```{info}\n{request_line}{header_lines}{body_block}\n```")
 }
 
-/// URL-encode a value for the query string. Mirrors JavaScript's
-/// `encodeURIComponent` — keeps the unreserved set intact, percent-
-/// encodes everything else.
-fn percent_encode_query(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        let keep = matches!(
-            b,
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~'
-            | b'!' | b'*' | b'\'' | b'(' | b')'
-        );
-        if keep {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{:02X}", b));
-        }
-    }
-    out
-}
-
 /// Render a query-param array as `k1=v1&k2=v2`. Empty keys are
 /// dropped (same as the parser's behavior on the read path).
+///
+/// Values are passed through verbatim — no percent-encoding. The
+/// parser doesn't decode either (`?q=hello%20world` parses as value
+/// `"hello%20world"`), so users author whatever they want on the URL
+/// and it round-trips literally. This matches the desktop / TS
+/// implementation in `src/lib/blocks/http-fence.ts:formatParam`.
 fn build_query_string(params: &[serde_json::Value]) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(params.len());
     for p in params {
@@ -149,7 +134,11 @@ fn build_query_string(params: &[serde_json::Value]) -> String {
             continue;
         }
         let value = p.get("value").and_then(|v| v.as_str()).unwrap_or("");
-        parts.push(format!("{}={}", percent_encode_query(key), percent_encode_query(value)));
+        if value.is_empty() {
+            parts.push(key.to_string());
+        } else {
+            parts.push(format!("{key}={value}"));
+        }
     }
     parts.join("&")
 }
@@ -379,17 +368,19 @@ mod tests {
     }
 
     #[test]
-    fn http_query_params_appended_url_encoded() {
+    fn http_query_params_inlined_verbatim() {
         // Legacy JSON body with structured `params` array. The
-        // serializer must inline them onto the URL with `?k=v&...`,
-        // url-encoding values that contain reserved characters.
+        // serializer inlines them onto the URL with `?k=v&...`,
+        // values verbatim — no url-encoding (paritied with TS at
+        // `src/lib/blocks/http-fence.ts:formatParam`, which also
+        // passes values through unchanged).
         let parsed = parse_blocks(
-            "```http alias=q\n{\"method\":\"GET\",\"url\":\"https://api.test.com/search\",\"params\":[{\"key\":\"q\",\"value\":\"hello world\"},{\"key\":\"page\",\"value\":\"2\"}],\"headers\":[],\"body\":\"\"}\n```\n",
+            "```http alias=q\n{\"method\":\"GET\",\"url\":\"https://api.test.com/search\",\"params\":[{\"key\":\"q\",\"value\":\"hello%20world\"},{\"key\":\"page\",\"value\":\"2\"}],\"headers\":[],\"body\":\"\"}\n```\n",
         );
         let out = serialize_block(&parsed[0]);
         assert!(
             out.contains("?q=hello%20world&page=2"),
-            "expected url-encoded query string in output, got: {out}",
+            "expected query string verbatim in output, got: {out}",
         );
         // Re-parse round-trips: the structural URL is preserved.
         let reparsed = parse_blocks(&out);
