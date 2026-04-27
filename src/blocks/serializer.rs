@@ -37,8 +37,14 @@ fn serialize_db_block(block: &ParsedBlock) -> String {
 
     let params = block.params.as_object();
     if let Some(obj) = params {
+        // Read `connection` (canonical, written by the TUI's
+        // connection picker after redesign) first, falling back to
+        // `connection_id` (legacy / parser-emitted). Without this
+        // fallback, a freshly-edited block whose connection came
+        // from the picker would lose the connection on serialize.
         if let Some(conn) = obj
-            .get("connection_id")
+            .get("connection")
+            .or_else(|| obj.get("connection_id"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
