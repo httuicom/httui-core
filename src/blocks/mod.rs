@@ -6,7 +6,13 @@
 //! - [`parser`] — markdown → [`ParsedBlock`]
 //! - [`serializer`] — [`ParsedBlock`] → fenced markdown (canonical, deterministic)
 //! - [`registry`] — alias mapping for block-type → executor names
+//! - [`db_export`] — pure serializers for db `Select` results
+//!   (CSV / JSON / Markdown table / INSERT statements + table-name
+//!   inference). Used by the TUI export menu and reusable from the
+//!   desktop once it migrates off `src/lib/blocks/db-export.ts`.
 
+pub mod db_export;
+pub mod http_codegen;
 pub mod parser;
 pub mod registry;
 pub mod serializer;
