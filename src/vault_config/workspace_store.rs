@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 use super::atomic::{read_toml, write_toml};
 use super::layout::{WORKSPACE_DIR, WORKSPACE_FILE};
 use super::merge::{load_with_local, mtime_or_none};
-use super::workspace::{WorkspaceDefaults, WorkspaceFile};
+use super::workspace::{FileSettings, WorkspaceDefaults, WorkspaceFile};
 use super::Version;
 
 /// Cache entry. Keys on both base and override mtimes so a touch on
@@ -132,6 +132,42 @@ impl WorkspaceStore {
         // Mutate the base file, not the merged view (audit-003).
         let mut file = self.load_base_only().await?;
         file.defaults = defaults;
+        self.persist(file).await
+    }
+
+    /// Read per-file settings for a vault-relative `file_path`. Returns
+    /// the `Default::default()` value when the file has no entry. The
+    /// merged view (`load`) is consulted, so `.local.toml` overrides
+    /// surface to readers — useful for per-machine experimental flips.
+    pub async fn file_settings(&self, file_path: &str) -> Result<FileSettings, String> {
+        let file = self.load().await?;
+        Ok(file.files.get(file_path).cloned().unwrap_or_default())
+    }
+
+    /// Set the `auto_capture` flag for `file_path`. Mutates the **base**
+    /// file (audit-003) so local overrides survive the round-trip.
+    /// When the resulting `FileSettings` matches the default, the entry
+    /// is removed from the map so workspace.toml stays minimal.
+    pub async fn set_file_auto_capture(
+        &self,
+        file_path: &str,
+        auto_capture: bool,
+    ) -> Result<(), String> {
+        if file_path.trim().is_empty() {
+            return Err("file_path must not be empty".to_string());
+        }
+        let mut file = self.load_base_only().await?;
+        let mut entry = file
+            .files
+            .get(file_path)
+            .cloned()
+            .unwrap_or_default();
+        entry.auto_capture = auto_capture;
+        if entry.is_default() {
+            file.files.remove(file_path);
+        } else {
+            file.files.insert(file_path.to_string(), entry);
+        }
         self.persist(file).await
     }
 
@@ -343,6 +379,94 @@ mod tests {
         std::fs::write(&local, "[defaults]\nenvironment = \"dev\"\n").unwrap();
         let d = s.defaults().await.unwrap();
         assert_eq!(d.environment.as_deref(), Some("dev"));
+    }
+
+    #[tokio::test]
+    async fn file_settings_returns_default_when_file_missing() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir);
+        let settings = s.file_settings("rollout.md").await.unwrap();
+        assert!(!settings.auto_capture);
+    }
+
+    #[tokio::test]
+    async fn set_file_auto_capture_persists_and_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir);
+        s.set_file_auto_capture("rollout.md", true).await.unwrap();
+        let raw = std::fs::read_to_string(s.path()).unwrap();
+        assert!(
+            raw.contains("[files.\"rollout.md\"]"),
+            "table header missing: {raw}"
+        );
+        assert!(
+            raw.contains("auto_capture = true"),
+            "value missing: {raw}"
+        );
+        let read_back = s.file_settings("rollout.md").await.unwrap();
+        assert!(read_back.auto_capture);
+    }
+
+    #[tokio::test]
+    async fn flipping_back_to_default_prunes_the_entry() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir);
+        s.set_file_auto_capture("rollout.md", true).await.unwrap();
+        s.set_file_auto_capture("rollout.md", false).await.unwrap();
+        let raw = std::fs::read_to_string(s.path()).unwrap();
+        assert!(
+            !raw.contains("[files."),
+            "table should have been pruned: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_for_other_files_does_not_disturb_existing_entries() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir);
+        s.set_file_auto_capture("rollout.md", true).await.unwrap();
+        s.set_file_auto_capture("smoke.md", true).await.unwrap();
+        let f = s.load().await.unwrap();
+        assert!(f.files.get("rollout.md").unwrap().auto_capture);
+        assert!(f.files.get("smoke.md").unwrap().auto_capture);
+    }
+
+    #[tokio::test]
+    async fn set_with_empty_path_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir);
+        let err = s.set_file_auto_capture("   ", true).await.unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_does_not_promote_local_into_base() {
+        // Pre-existing local override on `defaults` must survive even
+        // when we mutate the base via the file-settings API
+        // (audit-003 contract).
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir);
+        s.set_defaults(WorkspaceDefaults {
+            environment: Some("staging".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let local = dir.path().join(WORKSPACE_DIR).join("workspace.local.toml");
+        std::fs::write(&local, "[defaults]\nenvironment = \"dev\"\n").unwrap();
+        s.invalidate_cache().await;
+
+        s.set_file_auto_capture("rollout.md", true).await.unwrap();
+
+        let base_text = std::fs::read_to_string(s.path()).unwrap();
+        // The base still has staging — `.local.toml` did not leak in.
+        assert!(
+            base_text.contains("environment = \"staging\""),
+            "got: {base_text}"
+        );
+        // The .local file is untouched.
+        let local_text = std::fs::read_to_string(&local).unwrap();
+        assert!(local_text.contains("dev"));
     }
 
     #[test]

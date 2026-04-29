@@ -196,6 +196,7 @@ mod tests {
                 git_remote: Some("origin".into()),
                 git_branch: Some("main".into()),
             },
+            files: Default::default(),
         };
         write_toml(&path, &original).unwrap();
         let loaded: WorkspaceFile = read_toml(&path).unwrap();
