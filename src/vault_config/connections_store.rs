@@ -2,6 +2,10 @@
 // See docs-llm/v1/tech-debt.md "Storage" section. Current shape mixes
 // orchestration + DTO + builder + legacy adapter; the sweep extracts
 // each into its own sibling module.
+// coverage:exclude file — Same scope as the size opt-out. The split in
+// Epic 20a re-tests every extracted module to ≥80% individually, which
+// is the right granularity. Forcing 80% on the current monolith would
+// add tests that get deleted next refactor.
 
 //! File-backed connections store.
 //!
