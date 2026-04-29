@@ -17,6 +17,7 @@ pub mod environments_store;
 pub mod envs;
 pub mod gitignore;
 pub mod merge;
+pub mod migration;
 pub mod user;
 pub mod user_store;
 pub mod validate;
