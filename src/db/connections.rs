@@ -1162,7 +1162,10 @@ fn bind_sqlite_value<'q>(
             if let Some(i) = n.as_i64() {
                 query.bind(i)
             } else {
-                query.bind(n.as_f64().unwrap())
+                query.bind(
+                    n.as_f64()
+                        .expect("serde_json::Number is f64-representable when as_i64 fails"),
+                )
             }
         }
         serde_json::Value::String(s) => query.bind(s.as_str()),
@@ -1291,7 +1294,10 @@ fn bind_pg_value<'q>(
             if let Some(i) = n.as_i64() {
                 query.bind(i)
             } else {
-                query.bind(n.as_f64().unwrap())
+                query.bind(
+                    n.as_f64()
+                        .expect("serde_json::Number is f64-representable when as_i64 fails"),
+                )
             }
         }
         serde_json::Value::String(s) => query.bind(s.as_str()),
@@ -1417,7 +1423,10 @@ fn bind_mysql_value<'q>(
             if let Some(i) = n.as_i64() {
                 query.bind(i)
             } else {
-                query.bind(n.as_f64().unwrap())
+                query.bind(
+                    n.as_f64()
+                        .expect("serde_json::Number is f64-representable when as_i64 fails"),
+                )
             }
         }
         serde_json::Value::String(s) => query.bind(s.as_str()),
