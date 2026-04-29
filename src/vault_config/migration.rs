@@ -1,15 +1,21 @@
 //! One-shot migration from MVP SQLite-backed storage to the v1 file
 //! layout (ADR 0001). Reads from a live `notes.db` pool, writes
-//! `connections.toml` and `envs/<name>.toml` via the new stores, and
-//! optionally backs up the database first.
+//! `connections.toml`, `envs/<name>.toml` and the `[ui]` section of
+//! `user.toml`, and optionally backs up the database first.
 //!
-//! Scope: connections + environments + variables. The `app_config`
-//! prefs migration (theme/font/etc.) lives in Epic 19 alongside the
-//! `UiPrefs` schema bump and the frontend cutover. See audit-005.
+//! Scope: connections + environments + variables + the seven
+//! `app_config` UI prefs (`theme`, `auto_save_ms`,
+//! `editor_font_size`, `default_fetch_size`, `history_retention`,
+//! `vim_enabled`, `sidebar_open`). Session-state keys (`vaults`,
+//! `active_vault`, `pane_layout`, `active_pane_id`, `active_file`,
+//! `scroll_positions`) **stay in SQLite** per audit-001.
 //!
 //! The migration is **idempotent**: rerunning on an already-populated
 //! vault is safe — duplicate-name failures from the underlying stores
-//! are folded into a "skipped" counter rather than aborting.
+//! are folded into a "skipped" counter rather than aborting. Re-
+//! running prefs migration overwrites the `[ui]` section with the
+//! latest SQLite values; `user.toml` is per-machine, this is the
+//! correct behaviour for first-run-after-schema-bump.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +24,10 @@ use sqlx::sqlite::SqlitePool;
 
 use super::connections_store::CreateConnectionInput;
 use super::environments_store::SetVarInput;
+use super::user::UiPrefs;
+use super::user_store::UserStore;
 use super::{ConnectionsStore, EnvironmentsStore};
+use crate::config;
 use crate::db::{connections, environments};
 
 /// Per-call options. Build via [`MigrationOptions::default`] and
@@ -59,6 +68,9 @@ pub struct MigrationReport {
     pub environments_skipped: usize,
     pub variables_migrated: usize,
     pub variables_skipped: usize,
+    /// Number of `app_config` prefs keys that landed in
+    /// `user.toml [ui]`. Each found+parsed key counts once.
+    pub prefs_migrated: usize,
     pub dry_run: bool,
     /// Free-form notes about deferred work / dual-storage warning.
     pub notes: Vec<String>,
@@ -95,6 +107,7 @@ pub async fn run_migration(
         &mut report,
     )
     .await?;
+    migrate_prefs(pool, &opts.user_config_path, opts.dry_run, &mut report).await?;
 
     if opts.dry_run {
         report
@@ -102,12 +115,107 @@ pub async fn run_migration(
             .push("Dry run — nothing written. Re-run with dry_run=false to apply.".to_string());
     } else {
         report.notes.push(
-            "Connections + envs migrated to TOML. The legacy SQLite tables are still read by the running app — Epic 19 cuts the Tauri commands over and drops the tables."
+            "Connections + envs + prefs migrated. The legacy SQLite `connections` / `environments` / `env_variables` tables are still read by the running app until the frontend cutover lands; the seven prefs keys in `app_config` can be dropped now."
                 .to_string(),
         );
     }
 
     Ok(report)
+}
+
+/// Migrate the seven UI prefs keys from `app_config` into the
+/// per-machine `user.toml [ui]` section. See audit-005 for the
+/// scope decision and the original audit
+/// `docs-llm/v1/audit-app-config-keys.md` for the per-key
+/// classification.
+async fn migrate_prefs(
+    pool: &SqlitePool,
+    user_config_path: &Path,
+    dry_run: bool,
+    report: &mut MigrationReport,
+) -> Result<(), String> {
+    // Read each app_config row; missing rows just leave the
+    // corresponding UiPrefs field at its default.
+    let mut prefs = UiPrefs::default();
+    let mut count: usize = 0;
+
+    if let Some(theme_json) = get_pref(pool, "theme").await? {
+        if apply_theme_json(&theme_json, &mut prefs) {
+            count += 1;
+        }
+    }
+    if let Some(ms) = get_pref(pool, "auto_save_ms").await? {
+        if let Ok(n) = ms.parse::<u32>() {
+            prefs.auto_save_ms = n;
+            count += 1;
+        }
+    }
+    if let Some(s) = get_pref(pool, "editor_font_size").await? {
+        if let Ok(n) = s.parse::<u16>() {
+            prefs.font_size = n;
+            count += 1;
+        }
+    }
+    if let Some(s) = get_pref(pool, "default_fetch_size").await? {
+        if let Ok(n) = s.parse::<u32>() {
+            prefs.default_fetch_size = n;
+            count += 1;
+        }
+    }
+    if let Some(s) = get_pref(pool, "history_retention").await? {
+        if let Ok(n) = s.parse::<u32>() {
+            prefs.history_retention = n;
+            count += 1;
+        }
+    }
+    if let Some(s) = get_pref(pool, "vim_enabled").await? {
+        prefs.vim_enabled = s == "true";
+        count += 1;
+    }
+    if let Some(s) = get_pref(pool, "sidebar_open").await? {
+        prefs.sidebar_open = s == "true";
+        count += 1;
+    }
+
+    report.prefs_migrated = count;
+    if dry_run || count == 0 {
+        return Ok(());
+    }
+
+    // Write back via UserStore so the atomic-write + version stamp
+    // contract from epic 09 applies.
+    let store = UserStore::with_path(user_config_path);
+    store.set_ui(prefs).await?;
+    Ok(())
+}
+
+async fn get_pref(pool: &SqlitePool, key: &str) -> Result<Option<String>, String> {
+    config::get_config(pool, key)
+        .await
+        .map_err(|e| format!("read app_config[{key}]: {e}"))
+}
+
+/// MVP frontend serialised theme as a JSON object
+/// `{ mode, accent, ... }` per `stores/settings.ts`. We only
+/// migrate `mode` into the `theme` string; accent/etc. are
+/// per-machine UI niceties that the new `[ui]` section doesn't
+/// have room for yet — Epic 27+ will expand the schema if needed.
+/// Returns `true` when at least the `mode` field was extracted.
+fn apply_theme_json(raw: &str, out: &mut UiPrefs) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    if let Some(mode) = value.get("mode").and_then(|v| v.as_str()) {
+        out.theme = mode.to_string();
+        return true;
+    }
+    // Some MVP installs stored the bare string ("dark"). Try that
+    // shape too before giving up.
+    if let Some(s) = value.as_str() {
+        out.theme = s.to_string();
+        return true;
+    }
+    false
 }
 
 async fn migrate_connections(
@@ -392,5 +500,158 @@ mod tests {
         };
         let input = legacy_to_input(&c);
         assert!(input.port.is_none());
+    }
+
+    // --- prefs migration -----------------------------------------------
+
+    #[tokio::test]
+    async fn migrate_prefs_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let pool = init_db(tmp.path()).await.unwrap();
+
+        // Populate the seven keys.
+        config::set_config(&pool, "theme", r#"{"mode":"dark","accent":"purple"}"#)
+            .await
+            .unwrap();
+        config::set_config(&pool, "auto_save_ms", "500")
+            .await
+            .unwrap();
+        config::set_config(&pool, "editor_font_size", "13")
+            .await
+            .unwrap();
+        config::set_config(&pool, "default_fetch_size", "200")
+            .await
+            .unwrap();
+        config::set_config(&pool, "history_retention", "25")
+            .await
+            .unwrap();
+        config::set_config(&pool, "vim_enabled", "true")
+            .await
+            .unwrap();
+        config::set_config(&pool, "sidebar_open", "false")
+            .await
+            .unwrap();
+
+        let user_path = tmp.path().join("user.toml");
+        let opts = MigrationOptions {
+            dry_run: false,
+            backup: false,
+            user_config_path: user_path.clone(),
+        };
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        let report = run_migration(&pool, &vault, &opts).await.unwrap();
+        assert_eq!(report.prefs_migrated, 7);
+
+        // Re-read user.toml via UserStore and confirm the values
+        // landed.
+        let store = UserStore::with_path(&user_path);
+        let ui = store.ui().await.unwrap();
+        assert_eq!(ui.theme, "dark");
+        assert_eq!(ui.auto_save_ms, 500);
+        assert_eq!(ui.font_size, 13);
+        assert_eq!(ui.default_fetch_size, 200);
+        assert_eq!(ui.history_retention, 25);
+        assert!(ui.vim_enabled);
+        assert!(!ui.sidebar_open);
+    }
+
+    #[tokio::test]
+    async fn migrate_prefs_dry_run_does_not_write() {
+        let tmp = TempDir::new().unwrap();
+        let pool = init_db(tmp.path()).await.unwrap();
+        config::set_config(&pool, "auto_save_ms", "500")
+            .await
+            .unwrap();
+
+        let user_path = tmp.path().join("user.toml");
+        let opts = MigrationOptions {
+            dry_run: true,
+            backup: false,
+            user_config_path: user_path.clone(),
+        };
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        let report = run_migration(&pool, &vault, &opts).await.unwrap();
+        assert_eq!(report.prefs_migrated, 1, "counts what would migrate");
+        assert!(!user_path.exists(), "dry run never writes");
+    }
+
+    #[tokio::test]
+    async fn migrate_prefs_zero_when_no_app_config_rows() {
+        let tmp = TempDir::new().unwrap();
+        let pool = init_db(tmp.path()).await.unwrap();
+        let user_path = tmp.path().join("user.toml");
+        let opts = MigrationOptions {
+            dry_run: false,
+            backup: false,
+            user_config_path: user_path.clone(),
+        };
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        let report = run_migration(&pool, &vault, &opts).await.unwrap();
+        assert_eq!(report.prefs_migrated, 0);
+        // No prefs to write → user.toml stays absent.
+        assert!(!user_path.exists());
+    }
+
+    #[tokio::test]
+    async fn migrate_prefs_skips_unparseable_values() {
+        let tmp = TempDir::new().unwrap();
+        let pool = init_db(tmp.path()).await.unwrap();
+        config::set_config(&pool, "auto_save_ms", "not-a-number")
+            .await
+            .unwrap();
+        config::set_config(&pool, "editor_font_size", "13")
+            .await
+            .unwrap();
+
+        let user_path = tmp.path().join("user.toml");
+        let opts = MigrationOptions {
+            dry_run: false,
+            backup: false,
+            user_config_path: user_path.clone(),
+        };
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        let report = run_migration(&pool, &vault, &opts).await.unwrap();
+        // Only the parsable value counts.
+        assert_eq!(report.prefs_migrated, 1);
+    }
+
+    #[test]
+    fn apply_theme_json_handles_object_shape() {
+        let mut prefs = UiPrefs::default();
+        let ok = apply_theme_json(r#"{"mode":"dark"}"#, &mut prefs);
+        assert!(ok);
+        assert_eq!(prefs.theme, "dark");
+    }
+
+    #[test]
+    fn apply_theme_json_handles_bare_string() {
+        let mut prefs = UiPrefs::default();
+        let ok = apply_theme_json("\"high-contrast\"", &mut prefs);
+        assert!(ok);
+        assert_eq!(prefs.theme, "high-contrast");
+    }
+
+    #[test]
+    fn apply_theme_json_rejects_invalid_json() {
+        let mut prefs = UiPrefs::default();
+        let ok = apply_theme_json("not json", &mut prefs);
+        assert!(!ok);
+        // Defaults preserved.
+        assert_eq!(prefs.theme, "system");
+    }
+
+    #[test]
+    fn apply_theme_json_rejects_object_without_mode() {
+        let mut prefs = UiPrefs::default();
+        let ok = apply_theme_json(r#"{"accent":"red"}"#, &mut prefs);
+        assert!(!ok);
     }
 }

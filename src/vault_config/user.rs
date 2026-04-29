@@ -43,6 +43,24 @@ pub struct UiPrefs {
     pub font_size: u16,
     #[serde(default = "default_density")]
     pub density: String,
+    /// Editor auto-save debounce window in milliseconds.
+    /// MVP `app_config` key: `auto_save_ms`.
+    #[serde(default = "default_auto_save_ms")]
+    pub auto_save_ms: u32,
+    /// DB block default `LIMIT` when the user hasn't explicitly
+    /// pinned one. MVP `app_config` key: `default_fetch_size`.
+    #[serde(default = "default_fetch_size")]
+    pub default_fetch_size: u32,
+    /// Per-block history retention cap. MVP `app_config` key:
+    /// `history_retention`.
+    #[serde(default = "default_history_retention")]
+    pub history_retention: u32,
+    /// Editor vim-mode toggle. MVP `app_config` key: `vim_enabled`.
+    #[serde(default)]
+    pub vim_enabled: bool,
+    /// Sidebar open/closed. MVP `app_config` key: `sidebar_open`.
+    #[serde(default = "default_sidebar_open")]
+    pub sidebar_open: bool,
 }
 
 impl Default for UiPrefs {
@@ -52,6 +70,11 @@ impl Default for UiPrefs {
             font_family: default_font_family(),
             font_size: default_font_size(),
             density: default_density(),
+            auto_save_ms: default_auto_save_ms(),
+            default_fetch_size: default_fetch_size(),
+            history_retention: default_history_retention(),
+            vim_enabled: false,
+            sidebar_open: default_sidebar_open(),
         }
     }
 }
@@ -67,6 +90,18 @@ fn default_font_size() -> u16 {
 }
 fn default_density() -> String {
     "comfortable".to_string()
+}
+fn default_auto_save_ms() -> u32 {
+    1000
+}
+fn default_fetch_size() -> u32 {
+    100
+}
+fn default_history_retention() -> u32 {
+    10
+}
+fn default_sidebar_open() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
