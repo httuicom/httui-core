@@ -179,7 +179,7 @@ pub async fn update_search_entry(
 ) -> Result<(), String> {
     let title = file_path
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or(file_path)
         .trim_end_matches(".md");
 

@@ -419,9 +419,7 @@ pub fn blocks_above(blocks: &[ParsedBlock], line: usize) -> Vec<&ParsedBlock> {
 /// Strip the opening fence and return the info string, if any.
 /// Supports ``` and ~~~.
 fn strip_fence_open(line: &str) -> Option<&str> {
-    if line.starts_with("```") && line.len() > 3 {
-        Some(line[3..].trim())
-    } else if line.starts_with("~~~") && line.len() > 3 {
+    if (line.starts_with("```") || line.starts_with("~~~")) && line.len() > 3 {
         Some(line[3..].trim())
     } else {
         None

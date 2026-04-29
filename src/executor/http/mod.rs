@@ -299,7 +299,7 @@ impl HttpExecutor {
         } else {
             let text = String::from_utf8_lossy(&body_bytes).into_owned();
             serde_json::from_str::<serde_json::Value>(&text)
-                .unwrap_or_else(|_| serde_json::Value::String(text))
+                .unwrap_or(serde_json::Value::String(text))
         };
 
         let total_ms = t0.elapsed().as_millis() as u64;

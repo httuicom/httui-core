@@ -104,7 +104,7 @@ impl Connection {
             port: self.port,
             database_name: self.database_name.clone(),
             username: self.username.clone(),
-            has_password: self.password.as_ref().map_or(false, |p| !p.is_empty()),
+            has_password: self.password.as_ref().is_some_and(|p| !p.is_empty()),
             ssl_mode: self.ssl_mode.clone(),
             timeout_ms: self.timeout_ms,
             query_timeout_ms: self.query_timeout_ms,
@@ -548,17 +548,20 @@ fn extract_error_location(db_err: &dyn sqlx::error::DatabaseError) -> QueryError
     // Postgres: downcast to access the PgErrorPosition helper. The position
     // is an offset into the original query string (1-indexed). Callers
     // know the query and convert to line/col via `enrich_error_with_query`.
-    if let Some(pg) = db_err.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
-        if let Some(pos) = pg.position() {
-            if let sqlx::postgres::PgErrorPosition::Original(p) = pos {
-                // Stash position as raw column for now; caller converts
-                // once it has the query text.
-                return QueryErrorLocation {
-                    line: None,
-                    column: Some(p as u32),
-                };
-            }
-        }
+    if let Some(p) = db_err
+        .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+        .and_then(|pg| pg.position())
+        .and_then(|pos| match pos {
+            sqlx::postgres::PgErrorPosition::Original(p) => Some(p),
+            _ => None,
+        })
+    {
+        // Stash position as raw column for now; caller converts
+        // once it has the query text.
+        return QueryErrorLocation {
+            line: None,
+            column: Some(p as u32),
+        };
     }
     // MySQL: message often contains "near '…' at line N".
     let msg = db_err.message();
@@ -762,7 +765,7 @@ pub async fn create_connection(
     .bind(&input.name)
     .bind(&input.driver)
     .bind(&input.host)
-    .bind(&input.port)
+    .bind(input.port)
     .bind(&input.database_name)
     .bind(&input.username)
     .bind(&db_password)
@@ -837,7 +840,7 @@ pub async fn update_connection(
     .bind(&name)
     .bind(&driver)
     .bind(&host)
-    .bind(&port)
+    .bind(port)
     .bind(&database_name)
     .bind(&username)
     .bind(&password)
@@ -972,8 +975,8 @@ impl DatabasePool {
         let trimmed = sql.trim_start().to_uppercase();
 
         // T09: Restrict EXPLAIN ANALYZE with mutation keywords
-        if trimmed.starts_with("EXPLAIN") {
-            if trimmed.contains("ANALYZE") || trimmed.contains("ANALYSE") {
+        if trimmed.starts_with("EXPLAIN")
+            && (trimmed.contains("ANALYZE") || trimmed.contains("ANALYSE")) {
                 let after_explain = trimmed
                     .trim_start_matches("EXPLAIN")
                     .trim()
@@ -992,7 +995,6 @@ impl DatabasePool {
                     ));
                 }
             }
-        }
 
         let is_select = if trimmed.starts_with("PRAGMA") {
             // PRAGMA with = is a write operation (e.g. PRAGMA journal_mode=WAL)
@@ -1112,7 +1114,7 @@ async fn execute_select_sqlite(
 
     let json_rows: Vec<JsonRow> = rows
         .iter()
-        .map(|row| sqlite_row_to_json(row))
+        .map(sqlite_row_to_json)
         .collect();
 
     Ok(QueryResult {
@@ -1241,7 +1243,7 @@ async fn execute_select_pg(
         Vec::new()
     };
 
-    let json_rows: Vec<JsonRow> = rows.iter().map(|row| pg_row_to_json(row)).collect();
+    let json_rows: Vec<JsonRow> = rows.iter().map(pg_row_to_json).collect();
 
     Ok(QueryResult {
         columns,
@@ -1368,7 +1370,7 @@ async fn execute_select_mysql(
         Vec::new()
     };
 
-    let json_rows: Vec<JsonRow> = rows.iter().map(|row| mysql_row_to_json(row)).collect();
+    let json_rows: Vec<JsonRow> = rows.iter().map(mysql_row_to_json).collect();
 
     Ok(QueryResult {
         columns,
@@ -2079,7 +2081,7 @@ mod tests {
             .unwrap();
 
         assert!(result.is_select);
-        assert_eq!(result.has_more, false);
+        assert!(!result.has_more);
         assert_eq!(result.rows.len(), 3);
         assert_eq!(result.columns.len(), 3);
         assert_eq!(result.columns[0].name, "id");
@@ -2110,7 +2112,7 @@ mod tests {
             .execute_query("SELECT * FROM items", &[], 0, 3)
             .await
             .unwrap();
-        assert_eq!(result.has_more, true);
+        assert!(result.has_more);
         assert_eq!(result.rows.len(), 3);
 
         // offset=9, fetch_size=3 → 1 row, has_more=false
@@ -2118,7 +2120,7 @@ mod tests {
             .execute_query("SELECT * FROM items", &[], 9, 3)
             .await
             .unwrap();
-        assert_eq!(result.has_more, false);
+        assert!(!result.has_more);
         assert_eq!(result.rows.len(), 1);
     }
 
@@ -2578,7 +2580,7 @@ mod tests {
             serde_json::Value::Null,
             serde_json::json!(true),
             serde_json::json!(42),
-            serde_json::json!(3.14),
+            serde_json::json!(2.5),
             serde_json::json!("hello"),
         ];
         assert!(validate_bind_values(&vals).is_ok());
@@ -2651,6 +2653,11 @@ mod tests {
     // ─────── Fail-secure: keychain unavailable must NOT fall back to plaintext ───────
 
     #[tokio::test]
+    // The std::Mutex guard intentionally spans the awaits below: the lock
+    // serializes tests that mutate the keychain's global mock-failure flag,
+    // and dropping it earlier would let parallel tests corrupt that state.
+    // Tests run on a single tokio thread per case, so blocking is fine.
+    #[allow(clippy::await_holding_lock)]
     async fn create_connection_fails_secure_when_keychain_unavailable() {
         // Epic 16, Story 02 invariant: if `store_secret` fails, the
         // connection row must NOT be inserted with a plaintext password.

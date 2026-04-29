@@ -111,7 +111,7 @@ pub fn to_markdown(columns: &[ColumnInfo], rows: &[Value]) -> String {
 fn md_escape(value: &str) -> String {
     let mut s = value.replace('\\', "\\\\").replace('|', "\\|");
     // Collapse CRLF/CR/LF to a single space so cells stay one-line.
-    s = s.replace("\r\n", " ").replace('\r', " ").replace('\n', " ");
+    s = s.replace("\r\n", " ").replace(['\r', '\n'], " ");
     s
 }
 
@@ -419,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn inserts_null_becomes_literal_NULL() {
+    fn inserts_null_becomes_literal_null() {
         let c = cols(&["v"]);
         let rows = vec![json!({"v": null}), json!({})];
         let sql = to_inserts(&c, &rows, "t");
@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn inserts_bool_uses_TRUE_FALSE() {
+    fn inserts_bool_uses_true_false() {
         let c = cols(&["b"]);
         let rows = vec![json!({"b": true}), json!({"b": false})];
         let sql = to_inserts(&c, &rows, "t");

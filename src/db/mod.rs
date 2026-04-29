@@ -90,7 +90,7 @@ pub async fn query_internal_db(
         return Err("Multi-statement queries are not allowed".to_string());
     }
 
-    let fetch_size = fetch_size.min(MAX_INTERNAL_FETCH_SIZE).max(1);
+    let fetch_size = fetch_size.clamp(1, MAX_INTERNAL_FETCH_SIZE);
     let offset = offset.min(MAX_INTERNAL_OFFSET);
 
     let limit = (fetch_size + 1) as i64;
@@ -120,7 +120,7 @@ pub async fn query_internal_db(
         Vec::new()
     };
 
-    let json_rows: Vec<JsonRow> = rows.iter().map(|row| sqlite_row_to_json(row)).collect();
+    let json_rows: Vec<JsonRow> = rows.iter().map(sqlite_row_to_json).collect();
 
     Ok(InternalQueryResult {
         columns,

@@ -144,7 +144,7 @@ mod tests {
         std::fs::write(legacy.join("notes.db"), b"legacy-data").unwrap();
         std::fs::write(legacy.join("tmp/foo.png"), b"img").unwrap();
 
-        let outcome = migrate_from_candidates(&target, &[legacy.clone()]).unwrap();
+        let outcome = migrate_from_candidates(&target, std::slice::from_ref(&legacy)).unwrap();
         assert!(matches!(&outcome, MigrationOutcome::Migrated { from } if from == &legacy));
 
         assert_eq!(std::fs::read(target.join("notes.db")).unwrap(), b"legacy-data");
