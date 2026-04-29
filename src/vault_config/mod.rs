@@ -17,6 +17,7 @@ pub mod connections;
 pub mod connections_store;
 pub mod environments_store;
 pub mod envs;
+pub mod error;
 pub mod gitignore;
 pub mod layout;
 pub mod merge;
@@ -34,6 +35,7 @@ pub mod workspace_store;
 pub use connection_views::ConnectionPublic;
 pub use connections::{Connection, ConnectionsFile};
 pub use connections_store::{ConnectionsStore, CreateConnectionInput, UpdateConnectionInput};
+pub use error::{ConnectionsError, VaultConfigError};
 pub use environments_store::{
     EnvVariablePublic, EnvironmentPublic, EnvironmentsStore, SetVarInput,
 };
