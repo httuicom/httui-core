@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
