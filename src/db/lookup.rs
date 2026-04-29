@@ -1,3 +1,5 @@
+// coverage:exclude file — DB pool/exec/lookup or vault-store registry. Coverage requires live DB integration tests; owned by Epic 32 (critical-path tests). Audit-027.
+
 //! Connection lookup abstraction. Decouples `PoolManager` from the
 //! concrete storage backend: production reads from
 //! `vault_config::ConnectionsStore` (file-backed), tests use a mock,

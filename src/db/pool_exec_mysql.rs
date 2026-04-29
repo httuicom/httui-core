@@ -1,3 +1,5 @@
+// coverage:exclude file — DB pool/exec/lookup or vault-store registry. Coverage requires live DB integration tests; owned by Epic 32 (critical-path tests). Audit-027.
+
 //! MySQL execute helpers used by the `DatabasePool::execute_*`
 //! dispatchers.
 //!

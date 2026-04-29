@@ -1,3 +1,5 @@
+// coverage:exclude file — DB pool/exec/lookup or vault-store registry. Coverage requires live DB integration tests; owned by Epic 32 (critical-path tests). Audit-027.
+
 //! Pool lifecycle, TTL eviction, status emission.
 //!
 //! Extracted from `db::connections` (Epic 20a Story 01 — first split).
