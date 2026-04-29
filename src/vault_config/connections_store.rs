@@ -26,14 +26,13 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 
 use crate::db::connections::Connection as LegacyConnection;
-use crate::db::keychain::{
-    delete_secret, get_secret, resolve_secret_ref, store_secret, KEYCHAIN_SENTINEL,
-};
+use crate::db::keychain::{delete_secret, KEYCHAIN_SENTINEL};
 
 use super::atomic::{read_toml, write_toml};
 use super::connections::{
     CommonFields, Connection, ConnectionsFile, MysqlConfig, PostgresConfig, SqliteConfig,
 };
+use super::secret_resolver::{ensure_keychain_ref, keychain_entry_exists, resolve_value};
 use super::validate::validate_connections_file;
 use super::Version;
 
@@ -484,9 +483,12 @@ fn build_connection_from_input(
     }
 }
 
-/// Convert `password` input to a `{{keychain:...}}` reference. If the
-/// caller already gave us a reference, we keep it. Otherwise we store
-/// the raw value in the keychain and return the matching reference.
+/// Convert `password` input to a `{{keychain:...}}` reference.
+///
+/// Routes through [`secret_resolver::ensure_keychain_ref`] so this
+/// store and `EnvironmentsStore` share the same idempotent flow:
+/// existing references pass through verbatim, raw values land in the
+/// keychain and come back as the canonical reference.
 fn ensure_password_ref(name: &str, password: Option<&str>) -> Result<String, String> {
     let Some(raw) = password else {
         return Ok(String::new());
@@ -494,22 +496,14 @@ fn ensure_password_ref(name: &str, password: Option<&str>) -> Result<String, Str
     if raw.is_empty() {
         return Ok(String::new());
     }
-    if super::validate::is_secret_ref(raw) {
-        return Ok(raw.to_string());
-    }
     let key = conn_password_keychain_key(name);
-    store_secret(&key, raw).map_err(|e| format!("Failed to store password securely: {e}"))?;
-    Ok(format_password_ref(name))
+    ensure_keychain_ref(&key, raw)
 }
 
 /// Keychain key for a connection's password. Mirrors the structure of
 /// the reference syntax, joined with `:`.
 pub fn conn_password_keychain_key(name: &str) -> String {
     format!("conn:{name}:password")
-}
-
-fn format_password_ref(name: &str) -> String {
-    format!("{{{{keychain:conn:{name}:password}}}}")
 }
 
 fn require<'a>(value: Option<&'a str>, field: &str, driver: &str) -> Result<&'a str, String> {
@@ -564,29 +558,11 @@ fn password_present(c: &Connection) -> bool {
         // actually has the entry. Best-effort lookup; a transient
         // keychain failure surfaces as has_password = false (caller
         // can then re-prompt).
-        if let Some((_, address)) = parse_keychain_ref(password) {
-            return get_secret(&address).map(|v| v.is_some()).unwrap_or(false);
-        }
-        false
+        keychain_entry_exists(password)
     } else {
         // Legacy plaintext value (pre-migration) or sentinel.
         password != KEYCHAIN_SENTINEL
     }
-}
-
-/// Parse `{{keychain:NS:KEY}}` into `(backend, "NS:KEY")` for keychain
-/// lookups. Returns `None` for non-keychain backends.
-fn parse_keychain_ref(s: &str) -> Option<(&'static str, String)> {
-    let trimmed = s.trim();
-    if !(trimmed.starts_with("{{") && trimmed.ends_with("}}")) {
-        return None;
-    }
-    let inner = &trimmed[2..trimmed.len() - 2];
-    let (backend, address) = inner.split_once(':')?;
-    if backend != "keychain" {
-        return None;
-    }
-    Some(("keychain", address.to_string()))
 }
 
 /// Convert a vault-config Connection to the legacy struct understood by
@@ -601,8 +577,8 @@ fn to_legacy(name: &str, c: &Connection) -> Result<LegacyConnection, String> {
     let is_readonly = common_of(c).read_only;
 
     let password = match c {
-        Connection::Postgres(p) => resolve_password_ref(&p.password)?,
-        Connection::Mysql(m) => resolve_password_ref(&m.password)?,
+        Connection::Postgres(p) => resolve_value(&p.password)?,
+        Connection::Mysql(m) => resolve_value(&m.password)?,
         _ => None,
     };
 
@@ -625,21 +601,6 @@ fn to_legacy(name: &str, c: &Connection) -> Result<LegacyConnection, String> {
         created_at: String::new(),
         updated_at: String::new(),
     })
-}
-
-fn resolve_password_ref(value: &str) -> Result<Option<String>, String> {
-    if value.is_empty() {
-        return Ok(None);
-    }
-    if !super::validate::is_secret_ref(value) {
-        // Plaintext (legacy) — pass through.
-        return Ok(Some(value.to_string()));
-    }
-    match resolve_secret_ref(value) {
-        Ok(Some(v)) => Ok(Some(v)),
-        Ok(None) => Err(format!("secret reference {value} did not resolve")),
-        Err(e) => Err(format!("keychain error resolving {value}: {e}")),
-    }
 }
 
 #[cfg(test)]
