@@ -17,7 +17,11 @@ pub fn compute_block_hash(
     hasher.update(environment_id.unwrap_or("").as_bytes());
     hasher.update(b"|conn:");
     hasher.update(connection_id.unwrap_or("").as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
