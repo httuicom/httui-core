@@ -4,6 +4,7 @@ pub mod environments;
 pub mod keychain;
 pub mod lookup;
 pub mod pool_manager;
+pub mod query_error;
 pub mod schema_cache;
 
 use serde::Serialize;
