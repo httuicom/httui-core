@@ -1,11 +1,14 @@
-//! `.env` auto-discovery: parse + classify (Epic 54 Story 01).
+//! `.env` auto-discovery: parse + classify + scan (Epic 54 Story 01).
 //!
-//! Scope: pure-string parsing and classification. The vault-side
-//! scanner that walks the filesystem on vault open + the Tauri
-//! command + UI banner ship in Stories 02-04 of Epic 54.
+//! Pure-string parsing + classification + a vault-root scanner that
+//! looks for `.env`-style files at the root and one level deep. The
+//! Tauri command, banner UI, and import flow ship in Stories 02-04 of
+//! Epic 54.
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// One parsed entry from a `.env`-style file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +178,80 @@ pub fn classify(key: &str, value: &str) -> EntryKind {
     EntryKind::Plain
 }
 
+// --- Scanner -----------------------------------------------------------
+
+/// Filenames recognised as `.env`-style by the auto-discovery scanner.
+const DOTENV_FILENAMES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.example",
+    ".envrc",
+    "dotenv.config",
+];
+
+/// Subdirectories skipped during the first-level scan: typical noisy
+/// or generated trees that almost never hold runbook-relevant secrets.
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".httui",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+    ".next",
+    ".cache",
+];
+
+/// One scanned file with its parsed entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DotenvFile {
+    pub path: PathBuf,
+    pub entries: Vec<DotenvEntry>,
+}
+
+/// Scan `root` and its first-level subdirectories for `.env`-style
+/// files. Returns one `DotenvFile` per file that parsed at least one
+/// entry. Files that don't exist or fail to read are silently skipped
+/// — auto-discovery is best-effort.
+pub fn scan_dotenv_files(root: &Path) -> Vec<DotenvFile> {
+    let mut out = Vec::new();
+    scan_dir(root, &mut out);
+
+    let Ok(entries) = fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if SKIP_DIRS.contains(&name) {
+            continue;
+        }
+        scan_dir(&path, &mut out);
+    }
+    out
+}
+
+fn scan_dir(dir: &Path, out: &mut Vec<DotenvFile>) {
+    for &name in DOTENV_FILENAMES {
+        let path = dir.join(name);
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let entries = parse_dotenv(&content);
+        if !entries.is_empty() {
+            out.push(DotenvFile { path, entries });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +416,98 @@ WEBHOOK_TOKEN='abc-def-123'
         assert!(matches!(entries[2].kind, EntryKind::Plain));
         assert!(matches!(entries[3].kind, EntryKind::Plain));
         assert_eq!(entries[4].kind, EntryKind::Secret);
+    }
+
+    // --- Scanner tests --------------------------------------------------
+
+    use std::fs as stdfs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn scan_finds_dotenv_at_root() {
+        let dir = tempdir().expect("tempdir");
+        stdfs::write(dir.path().join(".env"), "FOO=bar\nDB=postgres://u@h/d\n").unwrap();
+
+        let found = scan_dotenv_files(dir.path());
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, dir.path().join(".env"));
+        assert_eq!(found[0].entries.len(), 2);
+    }
+
+    #[test]
+    fn scan_finds_all_known_filenames_at_root() {
+        let dir = tempdir().expect("tempdir");
+        for name in [
+            ".env",
+            ".env.local",
+            ".env.development",
+            ".env.example",
+            ".envrc",
+            "dotenv.config",
+        ] {
+            stdfs::write(dir.path().join(name), "K=v\n").unwrap();
+        }
+
+        let found = scan_dotenv_files(dir.path());
+
+        assert_eq!(found.len(), 6);
+    }
+
+    #[test]
+    fn scan_includes_first_level_subdirs() {
+        let dir = tempdir().expect("tempdir");
+        stdfs::create_dir(dir.path().join("services")).unwrap();
+        stdfs::write(dir.path().join("services").join(".env"), "API=v\n").unwrap();
+
+        let found = scan_dotenv_files(dir.path());
+
+        assert_eq!(found.len(), 1);
+        assert!(found[0].path.ends_with("services/.env"));
+    }
+
+    #[test]
+    fn scan_skips_known_noisy_dirs() {
+        let dir = tempdir().expect("tempdir");
+        for noisy in ["node_modules", "target", ".git", "dist"] {
+            stdfs::create_dir(dir.path().join(noisy)).unwrap();
+            stdfs::write(dir.path().join(noisy).join(".env"), "X=y\n").unwrap();
+        }
+
+        let found = scan_dotenv_files(dir.path());
+
+        assert!(found.is_empty(), "should ignore noisy dirs, got {found:?}");
+    }
+
+    #[test]
+    fn scan_does_not_recurse_below_first_level() {
+        let dir = tempdir().expect("tempdir");
+        let deep = dir.path().join("apps").join("api");
+        stdfs::create_dir_all(&deep).unwrap();
+        stdfs::write(deep.join(".env"), "DEEP=1\n").unwrap();
+
+        let found = scan_dotenv_files(dir.path());
+
+        assert!(found.is_empty(), "second-level .env must not surface");
+    }
+
+    #[test]
+    fn scan_skips_empty_or_comment_only_files() {
+        let dir = tempdir().expect("tempdir");
+        stdfs::write(dir.path().join(".env"), "# only comments\n\n").unwrap();
+
+        let found = scan_dotenv_files(dir.path());
+
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn scan_returns_empty_for_missing_root() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+
+        let found = scan_dotenv_files(&missing);
+
+        assert!(found.is_empty());
     }
 }
