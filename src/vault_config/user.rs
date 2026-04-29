@@ -61,6 +61,13 @@ pub struct UiPrefs {
     /// Sidebar open/closed. MVP `app_config` key: `sidebar_open`.
     #[serde(default = "default_sidebar_open")]
     pub sidebar_open: bool,
+    /// Color mode preference: `"system"` | `"light"` | `"dark"`. The
+    /// frontend wires this to Chakra's color mode + `<html class>` so
+    /// `lib/theme.ts` semanticTokens resolve via `_dark` / `_light`.
+    /// Distinct from `theme` (legacy customisation JSON; pending
+    /// reframe in Epic 19 Story 01 sweep).
+    #[serde(default = "default_color_mode")]
+    pub color_mode: String,
 }
 
 impl Default for UiPrefs {
@@ -75,6 +82,7 @@ impl Default for UiPrefs {
             history_retention: default_history_retention(),
             vim_enabled: false,
             sidebar_open: default_sidebar_open(),
+            color_mode: default_color_mode(),
         }
     }
 }
@@ -102,6 +110,9 @@ fn default_history_retention() -> u32 {
 }
 fn default_sidebar_open() -> bool {
     true
+}
+fn default_color_mode() -> String {
+    "system".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,9 +187,23 @@ prompt_timeout_s = 30
         let f: UserFile = toml::from_str("").unwrap();
         assert_eq!(f.ui.theme, "system");
         assert_eq!(f.ui.font_size, 14);
+        assert_eq!(f.ui.color_mode, "system");
         assert_eq!(f.secrets.backend, "auto");
         assert!(f.secrets.biometric);
         assert!(f.active_envs.is_empty());
+    }
+
+    #[test]
+    fn color_mode_round_trips() {
+        let raw = "version = \"1\"\n[ui]\ncolor_mode = \"dark\"\n";
+        let f: UserFile = toml::from_str(raw).unwrap();
+        assert_eq!(f.ui.color_mode, "dark");
+
+        let serialized = toml::to_string(&f).unwrap();
+        assert!(serialized.contains("color_mode = \"dark\""));
+
+        let back: UserFile = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.ui.color_mode, "dark");
     }
 
     #[test]
