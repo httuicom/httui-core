@@ -1579,12 +1579,12 @@ fn validate_bind_values(bind_values: &[serde_json::Value]) -> Result<(), String>
                     "Bind value at index {i} is an object; only primitive types (null, bool, number, string) are supported"
                 ));
             }
-            serde_json::Value::Number(n) => {
-                if n.as_i64().is_none() && n.as_f64().is_none() {
-                    return Err(format!(
-                        "Bind value at index {i} is a number outside the supported range (i64/f64)"
-                    ));
-                }
+            serde_json::Value::Number(n)
+                if n.as_i64().is_none() && n.as_f64().is_none() =>
+            {
+                return Err(format!(
+                    "Bind value at index {i} is a number outside the supported range (i64/f64)"
+                ));
             }
             _ => {} // Null, Bool, String are fine
         }

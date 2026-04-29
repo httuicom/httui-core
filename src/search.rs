@@ -20,7 +20,7 @@ pub fn search_files(vault_path: &str, query: &str) -> Result<Vec<SearchResult>, 
     collect_md_files(root, root, &query_lower, &mut results)?;
 
     // Sort by score descending
-    results.sort_by(|a, b| b.score.cmp(&a.score));
+    results.sort_by_key(|b| std::cmp::Reverse(b.score));
     results.truncate(20);
     Ok(results)
 }
