@@ -15,7 +15,10 @@ use std::time::SystemTime;
 
 use tokio::sync::RwLock;
 
+use std::str::FromStr;
+
 use crate::db::connections::Connection as LegacyConnection;
+use crate::db::driver::DbDriver;
 use crate::db::keychain::delete_secret;
 
 use super::atomic::{read_toml, write_toml};
@@ -326,8 +329,11 @@ fn build_connection_from_input(
         read_only: is_readonly,
     };
 
-    match driver {
-        "postgres" => {
+    // SQL drivers go through the DbDriver enum; non-DB Connection
+    // variants (Mongo, Http, …) and unknown values fall through to
+    // the reject branches below.
+    match DbDriver::from_str(driver) {
+        Ok(DbDriver::Postgres) => {
             let host = require(host, "host", driver)?;
             let database = require(database_name, "database_name", driver)?;
             let user = require(username, "username", driver)?;
@@ -342,7 +348,7 @@ fn build_connection_from_input(
                 common,
             }))
         }
-        "mysql" => {
+        Ok(DbDriver::Mysql) => {
             let host = require(host, "host", driver)?;
             let database = require(database_name, "database_name", driver)?;
             let user = require(username, "username", driver)?;
@@ -356,20 +362,22 @@ fn build_connection_from_input(
                 common,
             }))
         }
-        "sqlite" => {
+        Ok(DbDriver::Sqlite) => {
             let path = require(database_name, "database_name (sqlite path)", driver)?;
             Ok(Connection::Sqlite(SqliteConfig {
                 path: path.to_string(),
                 common,
             }))
         }
-        // Variants below are reachable from a hand-edited TOML but the
-        // CRUD UI in v1 only creates the three DB types above. Reject
-        // create/update for the others until the UI catches up.
-        "mongo" | "http" | "ws" | "grpc" | "graphql" | "bigquery" | "shell" => {
-            Err(reject_unimplemented(driver))
-        }
-        other => Err(format!("unsupported driver: {other}")),
+        Err(_) => match driver {
+            // Variants below are reachable from a hand-edited TOML but
+            // the CRUD UI in v1 only creates the three DB types above.
+            // Reject create/update for the others until the UI catches up.
+            "mongo" | "http" | "ws" | "grpc" | "graphql" | "bigquery" | "shell" => {
+                Err(reject_unimplemented(driver))
+            }
+            other => Err(format!("unsupported driver: {other}")),
+        },
     }
 }
 

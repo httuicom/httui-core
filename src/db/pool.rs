@@ -17,7 +17,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use std::str::FromStr;
+
 use super::connections::Connection;
+use super::driver::DbDriver;
 use super::pool_exec_mysql::{execute_mutation_mysql, execute_select_mysql};
 use super::pool_exec_pg::{execute_mutation_pg, execute_select_pg};
 use super::pool_exec_sqlite::{execute_mutation_sqlite, execute_select_sqlite};
@@ -55,11 +58,20 @@ pub enum DatabasePool {
 }
 
 impl DatabasePool {
-    pub fn driver(&self) -> &str {
+    /// Driver as a `&'static str`. Matches the lowercase wire shape
+    /// (`type = "postgres"` etc.) — see [`DbDriver::as_str`].
+    pub fn driver(&self) -> &'static str {
+        self.driver_kind().as_str()
+    }
+
+    /// Typed driver — preferred for new dispatch sites over the
+    /// `&str` form. Replaces the old string-match in `create_pool`
+    /// at the call boundary.
+    pub fn driver_kind(&self) -> DbDriver {
         match self {
-            Self::Postgres(_) => "postgres",
-            Self::MySql(_) => "mysql",
-            Self::Sqlite(_) => "sqlite",
+            Self::Postgres(_) => DbDriver::Postgres,
+            Self::MySql(_) => DbDriver::Mysql,
+            Self::Sqlite(_) => DbDriver::Sqlite,
         }
     }
 
@@ -350,7 +362,8 @@ pub(super) fn validate_pool_config(conn: &Connection) -> Result<(), String> {
     // SQLite connections have no TCP port; skip the range check entirely
     // (older records may have been persisted with `port = 0` by an earlier
     // bug in `update_connection`, and we don't want them stuck unusable).
-    if conn.driver != "sqlite" {
+    let drv = DbDriver::from_str(&conn.driver).ok();
+    if drv != Some(DbDriver::Sqlite) {
         if let Some(port) = conn.port {
             if !(1..=65535).contains(&port) {
                 return Err(format!("port must be between 1 and 65535, got {port}"));
@@ -383,18 +396,22 @@ pub(super) async fn create_pool(conn: &Connection) -> Result<DatabasePool, Strin
     let max_conns = conn.max_pool_size as u32;
     let timeout = Duration::from_millis(conn.timeout_ms as u64);
 
-    match conn.driver.as_str() {
-        "postgres" => {
+    // Boundary parse — surface the same "Unsupported driver: <name>"
+    // shape the legacy match used to.
+    let drv =
+        DbDriver::from_str(&conn.driver).map_err(|_| format!("Unsupported driver: {}", conn.driver))?;
+    match drv {
+        DbDriver::Postgres => {
             let opts = build_pg_connect_options(conn)?;
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(max_conns)
                 .acquire_timeout(timeout)
                 .connect_with(opts)
                 .await
-                .map_err(|e| sanitize_connection_error("postgres", e))?;
+                .map_err(|e| sanitize_connection_error(DbDriver::Postgres.as_str(), e))?;
             Ok(DatabasePool::Postgres(pool))
         }
-        "mysql" => {
+        DbDriver::Mysql => {
             let opts = build_mysql_connect_options(conn)?;
             let db_name = conn.database_name.clone().unwrap_or_default();
             let mut pool_opts = sqlx::mysql::MySqlPoolOptions::new()
@@ -418,10 +435,10 @@ pub(super) async fn create_pool(conn: &Connection) -> Result<DatabasePool, Strin
             let pool = pool_opts
                 .connect_with(opts)
                 .await
-                .map_err(|e| sanitize_connection_error("mysql", e))?;
+                .map_err(|e| sanitize_connection_error(DbDriver::Mysql.as_str(), e))?;
             Ok(DatabasePool::MySql(pool))
         }
-        "sqlite" => {
+        DbDriver::Sqlite => {
             let path = conn
                 .database_name
                 .as_deref()
@@ -433,10 +450,9 @@ pub(super) async fn create_pool(conn: &Connection) -> Result<DatabasePool, Strin
                 .acquire_timeout(timeout)
                 .connect(&url)
                 .await
-                .map_err(|e| sanitize_connection_error("sqlite", e))?;
+                .map_err(|e| sanitize_connection_error(DbDriver::Sqlite.as_str(), e))?;
             Ok(DatabasePool::Sqlite(pool))
         }
-        other => Err(format!("Unsupported driver: {other}")),
     }
 }
 

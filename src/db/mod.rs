@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod connections;
+pub mod driver;
 pub mod environments;
 pub mod keychain;
 pub mod lookup;
