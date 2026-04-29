@@ -18,15 +18,19 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 
 use super::atomic::{read_toml, write_toml};
+use super::merge::{load_with_local, mtime_or_none};
 use super::workspace::{WorkspaceDefaults, WorkspaceFile};
 use super::Version;
 
 const WORKSPACE_DIR: &str = ".httui";
 const WORKSPACE_FILE: &str = "workspace.toml";
 
+/// Cache entry. Keys on both base and override mtimes so a touch on
+/// either side invalidates correctly (ADR 0004 cache rule).
 #[derive(Debug, Clone)]
 struct Cached {
-    mtime: Option<SystemTime>,
+    base_mtime: Option<SystemTime>,
+    local_mtime: Option<SystemTime>,
     file: WorkspaceFile,
 }
 
@@ -48,40 +52,36 @@ impl WorkspaceStore {
         self.vault_root.join(WORKSPACE_DIR).join(WORKSPACE_FILE)
     }
 
-    fn current_mtime(&self) -> Option<SystemTime> {
-        std::fs::metadata(self.path())
-            .ok()
-            .and_then(|m| m.modified().ok())
-    }
-
-    /// Returns the parsed file, using the cache when on-disk mtime is
-    /// unchanged. Returns a default-valued file when missing — this
-    /// matches the "auto-create on first run" contract: callers that
-    /// only read see sensible defaults; the file materialises on the
-    /// first `set_*` call.
+    /// Returns the parsed file with `*.local.toml` overrides merged
+    /// in (ADR 0004). Cache hits when both base and override mtimes
+    /// are unchanged. Returns a default-valued file when **both** are
+    /// missing — matches the "auto-create on first run" contract.
     pub async fn load(&self) -> Result<WorkspaceFile, String> {
         let path = self.path();
-        let disk_mtime = self.current_mtime();
+        let local_path = local_path_for(&path);
+        let base_mtime = mtime_or_none(&path);
+        let local_mtime = mtime_or_none(&local_path);
 
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.as_ref() {
-                if cached.mtime == disk_mtime {
+                if cached.base_mtime == base_mtime && cached.local_mtime == local_mtime {
                     return Ok(cached.file.clone());
                 }
             }
         }
 
-        let file = if path.exists() {
-            read_toml::<WorkspaceFile>(&path)
-                .map_err(|e| format!("read {}: {e}", path.display()))?
+        let file = if path.exists() || local_path.exists() {
+            let (parsed, _local) = load_with_local::<WorkspaceFile>(&path)?;
+            parsed
         } else {
             WorkspaceFile::default()
         };
 
         let mut cache = self.cache.write().await;
         *cache = Some(Cached {
-            mtime: disk_mtime,
+            base_mtime,
+            local_mtime,
             file: file.clone(),
         });
         Ok(file)
@@ -93,14 +93,24 @@ impl WorkspaceStore {
         // `[defaults]`.
         file.version = Version::V1;
         let path = self.path();
+        // ADR 0004: writes always target the base file, never `.local`.
         write_toml(&path, &file).map_err(|e| format!("write {}: {e}", path.display()))?;
 
+        // Invalidate; next `load()` re-merges from disk.
         let mut cache = self.cache.write().await;
-        *cache = Some(Cached {
-            mtime: self.current_mtime(),
-            file,
-        });
+        *cache = None;
         Ok(())
+    }
+
+    /// Read **just** the base file (no `.local` merge). Used by
+    /// mutating paths so writes don't promote local overrides into
+    /// the committed file. See audit-003 for the rationale.
+    async fn load_base_only(&self) -> Result<WorkspaceFile, String> {
+        let path = self.path();
+        if !path.exists() {
+            return Ok(WorkspaceFile::default());
+        }
+        read_toml::<WorkspaceFile>(&path).map_err(|e| format!("read {}: {e}", path.display()))
     }
 
     /// Force the next read to hit disk. Hooks into the file watcher
@@ -121,7 +131,8 @@ impl WorkspaceStore {
         normalize(&mut defaults.environment);
         normalize(&mut defaults.git_remote);
         normalize(&mut defaults.git_branch);
-        let mut file = self.load().await?;
+        // Mutate the base file, not the merged view (audit-003).
+        let mut file = self.load_base_only().await?;
         file.defaults = defaults;
         self.persist(file).await
     }
@@ -132,9 +143,15 @@ impl WorkspaceStore {
         if self.path().exists() {
             return Ok(());
         }
-        let file = self.load().await?;
+        // Don't write the merged view to disk — the `.local` side
+        // would leak into the committed base (audit-003).
+        let file = self.load_base_only().await?;
         self.persist(file).await
     }
+}
+
+fn local_path_for(base: &std::path::Path) -> PathBuf {
+    super::merge::local_override_path(base).unwrap_or_else(|| base.to_path_buf())
 }
 
 fn normalize(value: &mut Option<String>) {
@@ -265,7 +282,69 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(WORKSPACE_DIR)).unwrap();
         std::fs::write(s.path(), "this is not = = valid").unwrap();
         let err = s.load().await.unwrap_err();
-        assert!(err.contains("read"), "got {err}");
+        assert!(err.contains("parse"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn local_override_merges_into_load() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir);
+        // Base says staging.
+        s.set_defaults(WorkspaceDefaults {
+            environment: Some("staging".into()),
+            git_remote: Some("origin".into()),
+            git_branch: Some("main".into()),
+        })
+        .await
+        .unwrap();
+        // Local override flips environment to dev.
+        let local = dir.path().join(WORKSPACE_DIR).join("workspace.local.toml");
+        std::fs::write(&local, "[defaults]\nenvironment = \"dev\"\n").unwrap();
+        // Cache must invalidate by local mtime.
+        s.invalidate_cache().await;
+        let d = s.defaults().await.unwrap();
+        assert_eq!(d.environment.as_deref(), Some("dev"));
+        // Other base keys survive.
+        assert_eq!(d.git_remote.as_deref(), Some("origin"));
+        assert_eq!(d.git_branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn writes_target_base_not_local() {
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir);
+        let local = dir.path().join(WORKSPACE_DIR).join("workspace.local.toml");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "[defaults]\nenvironment = \"localish\"\n").unwrap();
+
+        // Setting via the API must not touch `.local.toml` (ADR 0004).
+        s.set_defaults(WorkspaceDefaults {
+            environment: Some("via-api".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // The base file now exists and contains the api-set value.
+        let base_text = std::fs::read_to_string(s.path()).unwrap();
+        assert!(base_text.contains("via-api"), "base: {base_text}");
+
+        // The .local file is untouched.
+        let local_text = std::fs::read_to_string(&local).unwrap();
+        assert!(local_text.contains("localish"));
+    }
+
+    #[tokio::test]
+    async fn local_only_no_base_still_loads() {
+        // Edge case: user has only a `.local.toml` (committed file
+        // hasn't been created yet). Merge should still work.
+        let dir = TempDir::new().unwrap();
+        let s = store(&dir);
+        let local = dir.path().join(WORKSPACE_DIR).join("workspace.local.toml");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "[defaults]\nenvironment = \"dev\"\n").unwrap();
+        let d = s.defaults().await.unwrap();
+        assert_eq!(d.environment.as_deref(), Some("dev"));
     }
 
     #[test]

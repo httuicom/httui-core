@@ -58,9 +58,12 @@ pub struct SetVarInput {
 
 // --- Cache -------------------------------------------------------------------
 
+/// Cache entry for one env file. Tracks both base and `.local`
+/// override mtimes per ADR 0004.
 #[derive(Debug, Clone)]
 struct CachedEnv {
-    mtime: Option<SystemTime>,
+    base_mtime: Option<SystemTime>,
+    local_mtime: Option<SystemTime>,
     file: EnvFile,
 }
 
@@ -90,36 +93,41 @@ impl EnvironmentsStore {
         self.envs_dir().join(format!("{name}.toml"))
     }
 
-    fn current_mtime(&self, path: &Path) -> Option<SystemTime> {
-        std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+    fn local_path_for(path: &Path) -> PathBuf {
+        super::merge::local_override_path(path).unwrap_or_else(|| path.to_path_buf())
     }
 
-    /// Load `<env>.toml`, using cache when on-disk mtime is unchanged.
-    /// Returns `Ok(None)` when the file doesn't exist (env not created).
+    /// Load `<env>.toml` with `<env>.local.toml` overrides merged in
+    /// (ADR 0004). Returns `Ok(None)` when **neither** file exists
+    /// (env not created). Cache hits when both base and override
+    /// mtimes are unchanged.
     async fn load_env(&self, name: &str) -> Result<Option<EnvFile>, String> {
         let path = self.env_file_path(name);
-        if !path.exists() {
+        let local = Self::local_path_for(&path);
+
+        if !path.exists() && !local.exists() {
             return Ok(None);
         }
-        let disk_mtime = self.current_mtime(&path);
+        let base_mtime = super::merge::mtime_or_none(&path);
+        let local_mtime = super::merge::mtime_or_none(&local);
 
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.get(name) {
-                if cached.mtime == disk_mtime {
+                if cached.base_mtime == base_mtime && cached.local_mtime == local_mtime {
                     return Ok(Some(cached.file.clone()));
                 }
             }
         }
 
-        let file: EnvFile =
-            read_toml(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let (file, _local) = super::merge::load_with_local::<EnvFile>(&path)?;
 
         let mut cache = self.cache.write().await;
         cache.insert(
             name.to_string(),
             CachedEnv {
-                mtime: disk_mtime,
+                base_mtime,
+                local_mtime,
                 file: file.clone(),
             },
         );
@@ -142,22 +150,32 @@ impl EnvironmentsStore {
             ));
         }
         let path = self.env_file_path(name);
+        // ADR 0004: writes always target the base file.
         write_toml(&path, &file).map_err(|e| format!("write {}: {e}", path.display()))?;
 
+        // Drop the cache entry; next `load_env(name)` re-reads + re-merges.
         let mut cache = self.cache.write().await;
-        cache.insert(
-            name.to_string(),
-            CachedEnv {
-                mtime: self.current_mtime(&path),
-                file,
-            },
-        );
+        cache.remove(name);
         Ok(())
     }
 
     pub async fn invalidate_cache(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
+    }
+
+    /// Read a single env's base file (no `.local` merge). Mutating
+    /// paths use this so writes don't promote local overrides into
+    /// the committed base. See audit-003. Returns `None` when the
+    /// base file doesn't exist, even if a sibling `.local` does.
+    async fn load_env_base_only(&self, name: &str) -> Result<Option<EnvFile>, String> {
+        let path = self.env_file_path(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        super::atomic::read_toml::<EnvFile>(&path)
+            .map(Some)
+            .map_err(|e| format!("read {}: {e}", path.display()))
     }
 
     // --- env-level CRUD -------------------------------------------------
@@ -290,8 +308,11 @@ impl EnvironmentsStore {
         if key.is_empty() {
             return Err("variable key is required".to_string());
         }
+        // Mutate base only (audit-003). Existence check uses the
+        // merged view above (load_env) implicitly: a local-only env
+        // has no base file, so the load_env_base_only error fires.
         let mut file = self
-            .load_env(&env_name)
+            .load_env_base_only(&env_name)
             .await?
             .ok_or_else(|| format!("environment '{env_name}' not found"))?;
 
@@ -322,8 +343,9 @@ impl EnvironmentsStore {
     }
 
     pub async fn delete_var(&self, env_name: &str, key: &str) -> Result<(), String> {
+        // Mutate base only (audit-003).
         let mut file = self
-            .load_env(env_name)
+            .load_env_base_only(env_name)
             .await?
             .ok_or_else(|| format!("environment '{env_name}' not found"))?;
         let removed_secret = file.secrets.remove(key).is_some();
@@ -676,5 +698,82 @@ BASE_URL = "http://localhost"
             .is_none());
         // Missing env
         assert!(store.resolve_var("nope", "X").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_override_merges_into_env() {
+        let (store, t) = fresh_store();
+        store.create_env("staging").await.unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: "staging".into(),
+                key: "BASE_URL".into(),
+                value: "https://api.staging.example.com".into(),
+                is_secret: false,
+            })
+            .await
+            .unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: "staging".into(),
+                key: "TENANT".into(),
+                value: "tnt_8f2a91".into(),
+                is_secret: false,
+            })
+            .await
+            .unwrap();
+
+        // User drops a `.local.toml` overriding BASE_URL only.
+        let local = t.path().join("envs/staging.local.toml");
+        std::fs::write(
+            &local,
+            "version = \"1\"\n[vars]\nBASE_URL = \"http://localhost:8080\"\n",
+        )
+        .unwrap();
+        store.invalidate_cache().await;
+
+        // BASE_URL is overridden, TENANT survives from the base.
+        let resolved = store.resolve_var("staging", "BASE_URL").await.unwrap();
+        assert_eq!(resolved.as_deref(), Some("http://localhost:8080"));
+        let tenant = store.resolve_var("staging", "TENANT").await.unwrap();
+        assert_eq!(tenant.as_deref(), Some("tnt_8f2a91"));
+    }
+
+    #[tokio::test]
+    async fn local_only_env_with_no_base_loads() {
+        // Edge: user dropped `staging.local.toml` without a committed
+        // `staging.toml` yet. ADR 0004 says merge still works.
+        let (store, t) = fresh_store();
+        std::fs::create_dir_all(t.path().join("envs")).unwrap();
+        std::fs::write(
+            t.path().join("envs/staging.local.toml"),
+            "version = \"1\"\n[vars]\nA = \"1\"\n",
+        )
+        .unwrap();
+        let resolved = store.resolve_var("staging", "A").await.unwrap();
+        assert_eq!(resolved.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn list_envs_skips_dot_local_files() {
+        let (store, t) = fresh_store();
+        std::fs::create_dir_all(t.path().join("envs")).unwrap();
+        std::fs::write(
+            t.path().join("envs/staging.toml"),
+            "version = \"1\"\n[vars]\nA = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.path().join("envs/staging.local.toml"),
+            "version = \"1\"\n[vars]\nA = \"local\"\n",
+        )
+        .unwrap();
+        let envs = store.list_envs().await.unwrap();
+        assert_eq!(
+            envs.len(),
+            1,
+            "list must not surface .local as separate env"
+        );
+        assert_eq!(envs[0].name, "staging");
     }
 }

@@ -87,10 +87,12 @@ pub struct ConnectionPublic {
 
 // --- store ---------------------------------------------------------------
 
-/// Cached parse + the on-disk mtime that produced it.
+/// Cached parse + the on-disk mtimes (base and `.local` override)
+/// that produced it. Per ADR 0004, either side changing invalidates.
 #[derive(Debug, Clone)]
 struct Cached {
-    mtime: Option<SystemTime>,
+    base_mtime: Option<SystemTime>,
+    local_mtime: Option<SystemTime>,
     file: ConnectionsFile,
 }
 
@@ -112,31 +114,31 @@ impl ConnectionsStore {
         self.vault_root.join(CONNECTIONS_FILE)
     }
 
-    fn current_mtime(&self) -> Option<SystemTime> {
-        std::fs::metadata(self.path())
-            .ok()
-            .and_then(|m| m.modified().ok())
+    fn local_path(&self) -> PathBuf {
+        super::merge::local_override_path(&self.path()).unwrap_or_else(|| self.path())
     }
 
-    /// Returns a parsed `ConnectionsFile`, using the cache when the
-    /// on-disk mtime hasn't changed. If the file doesn't exist, returns
-    /// an empty (default) file.
+    /// Returns a parsed `ConnectionsFile` with `connections.local.toml`
+    /// merged in (ADR 0004). Cache hits when both base and override
+    /// mtimes are unchanged.
     async fn load(&self) -> Result<ConnectionsFile, String> {
         let path = self.path();
-        let disk_mtime = self.current_mtime();
+        let local = self.local_path();
+        let base_mtime = super::merge::mtime_or_none(&path);
+        let local_mtime = super::merge::mtime_or_none(&local);
 
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.as_ref() {
-                if cached.mtime == disk_mtime {
+                if cached.base_mtime == base_mtime && cached.local_mtime == local_mtime {
                     return Ok(cached.file.clone());
                 }
             }
         }
 
-        let file = if path.exists() {
-            read_toml::<ConnectionsFile>(&path)
-                .map_err(|e| format!("read connections.toml: {e}"))?
+        let file = if path.exists() || local.exists() {
+            let (parsed, _local) = super::merge::load_with_local::<ConnectionsFile>(&path)?;
+            parsed
         } else {
             ConnectionsFile {
                 version: Version::V1,
@@ -146,7 +148,8 @@ impl ConnectionsStore {
 
         let mut cache = self.cache.write().await;
         *cache = Some(Cached {
-            mtime: disk_mtime,
+            base_mtime,
+            local_mtime,
             file: file.clone(),
         });
         Ok(file)
@@ -169,13 +172,14 @@ impl ConnectionsStore {
             ));
         }
         let path = self.path();
+        // ADR 0004: writes always target the base file.
         write_toml(&path, &file).map_err(|e| format!("write connections.toml: {e}"))?;
 
+        // Invalidate; next `load()` re-reads + re-merges from disk.
+        // We can't repopulate inline because the cached entry must be
+        // the *merged* view, and `file` here is base-only.
         let mut cache = self.cache.write().await;
-        *cache = Some(Cached {
-            mtime: self.current_mtime(),
-            file,
-        });
+        *cache = None;
         Ok(())
     }
 
@@ -184,6 +188,20 @@ impl ConnectionsStore {
     pub async fn invalidate_cache(&self) {
         let mut cache = self.cache.write().await;
         *cache = None;
+    }
+
+    /// Read **just** the base file (no `.local` merge). Mutating
+    /// paths use this so writes don't promote local overrides into
+    /// the committed base. See audit-003.
+    async fn load_base_only(&self) -> Result<ConnectionsFile, String> {
+        let path = self.path();
+        if !path.exists() {
+            return Ok(ConnectionsFile {
+                version: Version::V1,
+                connections: BTreeMap::new(),
+            });
+        }
+        read_toml::<ConnectionsFile>(&path).map_err(|e| format!("read connections.toml: {e}"))
     }
 
     pub async fn list_public(&self) -> Result<Vec<ConnectionPublic>, String> {
@@ -213,8 +231,10 @@ impl ConnectionsStore {
     }
 
     pub async fn create(&self, input: CreateConnectionInput) -> Result<ConnectionPublic, String> {
-        let mut file = self.load().await?;
-        if file.connections.contains_key(&input.name) {
+        // Existence check uses the merged view so "create x" fails
+        // when x already exists in either base or local.
+        let merged = self.load().await?;
+        if merged.connections.contains_key(&input.name) {
             return Err(format!("connection '{}' already exists", input.name));
         }
 
@@ -231,8 +251,11 @@ impl ConnectionsStore {
             input.description.as_deref(),
         )?;
 
-        file.connections.insert(input.name.clone(), conn.clone());
-        self.persist(file).await?;
+        // Mutate the base only (audit-003) so the local override
+        // doesn't get promoted on write.
+        let mut base = self.load_base_only().await?;
+        base.connections.insert(input.name.clone(), conn.clone());
+        self.persist(base).await?;
         Ok(to_public(&input.name, &conn))
     }
 
@@ -241,7 +264,8 @@ impl ConnectionsStore {
         name: &str,
         input: UpdateConnectionInput,
     ) -> Result<ConnectionPublic, String> {
-        let mut file = self.load().await?;
+        // Mutate the base only (audit-003).
+        let mut file = self.load_base_only().await?;
         let existing = file
             .connections
             .get(name)
@@ -290,7 +314,8 @@ impl ConnectionsStore {
     }
 
     pub async fn delete(&self, name: &str) -> Result<(), String> {
-        let mut file = self.load().await?;
+        // Mutate the base only (audit-003).
+        let mut file = self.load_base_only().await?;
         if file.connections.remove(name).is_none() {
             return Err(format!("connection '{name}' not found"));
         };
@@ -861,5 +886,97 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("unsupported driver"));
+    }
+
+    #[tokio::test]
+    async fn local_override_merges_into_connection() {
+        let _g = KEYCHAIN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, t) = fresh_store();
+        store
+            .create(CreateConnectionInput {
+                name: "pg".into(),
+                driver: "postgres".into(),
+                host: Some("pg.staging.acme.local".into()),
+                port: Some(5432),
+                database_name: Some("payments".into()),
+                username: Some("app".into()),
+                password: Some("secret".into()),
+                ssl_mode: None,
+                is_readonly: None,
+                description: None,
+            })
+            .await
+            .unwrap();
+
+        // Drop a local override pointing at an SSH tunnel.
+        let local = t.path().join("connections.local.toml");
+        std::fs::write(
+            &local,
+            "version = \"1\"\n[connections.pg]\ntype = \"postgres\"\nhost = \"127.0.0.1\"\nport = 15432\ndatabase = \"payments\"\nuser = \"app\"\npassword = \"\"\n",
+        )
+        .unwrap();
+        store.invalidate_cache().await;
+
+        let conn = store.get("pg").await.unwrap().unwrap();
+        assert_eq!(conn.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(conn.port, Some(15432));
+        // `database_name` survives from the base when not overridden.
+        assert_eq!(conn.database_name.as_deref(), Some("payments"));
+    }
+
+    #[tokio::test]
+    async fn writes_target_base_not_local() {
+        let _g = KEYCHAIN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, t) = fresh_store();
+        // Pre-create the base via API.
+        store
+            .create(CreateConnectionInput {
+                name: "pg".into(),
+                driver: "postgres".into(),
+                host: Some("base-host".into()),
+                port: Some(5432),
+                database_name: Some("x".into()),
+                username: Some("u".into()),
+                password: Some(String::new()),
+                ssl_mode: None,
+                is_readonly: None,
+                description: None,
+            })
+            .await
+            .unwrap();
+
+        // User drops a local override pointing at a tunnel.
+        let local = t.path().join("connections.local.toml");
+        std::fs::write(
+            &local,
+            "version = \"1\"\n[connections.pg]\nhost = \"local-host\"\nport = 15432\n",
+        )
+        .unwrap();
+        store.invalidate_cache().await;
+
+        // Update via the API. ADR 0004: writes hit the base file
+        // regardless of overrides.
+        store
+            .update(
+                "pg",
+                UpdateConnectionInput {
+                    host: Some("base-updated".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let base_text = std::fs::read_to_string(t.path().join("connections.toml")).unwrap();
+        assert!(base_text.contains("base-updated"), "base: {base_text}");
+        // Local file is unchanged.
+        let local_text = std::fs::read_to_string(&local).unwrap();
+        assert!(local_text.contains("local-host"));
+        assert!(!local_text.contains("base-updated"));
+
+        // The merged read still shows the local override on host.
+        let merged = store.get("pg").await.unwrap().unwrap();
+        assert_eq!(merged.host.as_deref(), Some("local-host"));
+        assert_eq!(merged.port, Some(15432));
     }
 }

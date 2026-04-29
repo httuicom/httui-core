@@ -15,6 +15,7 @@ pub mod connections;
 pub mod connections_store;
 pub mod environments_store;
 pub mod envs;
+pub mod merge;
 pub mod user;
 pub mod user_store;
 pub mod validate;
