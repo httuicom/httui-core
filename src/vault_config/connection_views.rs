@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::db::connections::Connection as LegacyConnection;
 use crate::db::keychain::KEYCHAIN_SENTINEL;
 
-use super::connections::{CommonFields, Connection};
+use super::connections::Connection;
 use super::secret_resolver::{keychain_entry_exists, resolve_value};
 use super::validate::is_secret_ref;
 
@@ -34,104 +34,52 @@ pub struct ConnectionPublic {
     pub description: Option<String>,
 }
 
-// --- variant accessors ---------------------------------------------------
+// --- variant accessors (delegate to DbConnection trait) ------------------
 
 pub(super) fn driver_string_for(c: &Connection) -> &'static str {
-    match c {
-        Connection::Postgres(_) => "postgres",
-        Connection::Mysql(_) => "mysql",
-        Connection::Sqlite(_) => "sqlite",
-        Connection::Mongo(_) => "mongo",
-        Connection::Http(_) => "http",
-        Connection::Ws(_) => "ws",
-        Connection::Grpc(_) => "grpc",
-        Connection::Graphql(_) => "graphql",
-        Connection::Bigquery(_) => "bigquery",
-        Connection::Shell(_) => "shell",
-    }
+    c.as_dyn().driver()
 }
 
 pub(super) fn host_of(c: &Connection) -> Option<String> {
-    match c {
-        Connection::Postgres(p) => Some(p.host.clone()),
-        Connection::Mysql(m) => Some(m.host.clone()),
-        _ => None,
-    }
+    c.as_dyn().host().map(str::to_owned)
 }
 
 pub(super) fn port_of(c: &Connection) -> Option<u16> {
-    match c {
-        Connection::Postgres(p) => Some(p.port),
-        Connection::Mysql(m) => Some(m.port),
-        _ => None,
-    }
+    c.as_dyn().port()
 }
 
 pub(super) fn database_name_of(c: &Connection) -> Option<String> {
-    match c {
-        Connection::Postgres(p) => Some(p.database.clone()),
-        Connection::Mysql(m) => Some(m.database.clone()),
-        Connection::Sqlite(s) => Some(s.path.clone()),
-        _ => None,
-    }
+    c.as_dyn().database_name().map(str::to_owned)
 }
 
 pub(super) fn username_of(c: &Connection) -> Option<String> {
-    match c {
-        Connection::Postgres(p) => Some(p.user.clone()),
-        Connection::Mysql(m) => Some(m.user.clone()),
-        _ => None,
-    }
+    c.as_dyn().username().map(str::to_owned)
 }
 
 pub(super) fn ssl_mode_of(c: &Connection) -> Option<String> {
-    match c {
-        Connection::Postgres(p) => p.ssl_mode.clone(),
-        _ => None,
-    }
+    c.as_dyn().ssl_mode().map(str::to_owned)
 }
 
 pub(super) fn existing_readonly(c: &Connection) -> bool {
-    common_of(c).read_only
+    c.as_dyn().common().read_only
 }
 
 pub(super) fn description_of(c: &Connection) -> Option<String> {
-    common_of(c).description.clone()
-}
-
-pub(super) fn common_of(c: &Connection) -> &CommonFields {
-    match c {
-        Connection::Postgres(p) => &p.common,
-        Connection::Mysql(m) => &m.common,
-        Connection::Sqlite(s) => &s.common,
-        Connection::Mongo(m) => &m.common,
-        Connection::Http(h) => &h.common,
-        Connection::Ws(w) => &w.common,
-        Connection::Grpc(g) => &g.common,
-        Connection::Graphql(g) => &g.common,
-        Connection::Bigquery(b) => &b.common,
-        Connection::Shell(s) => &s.common,
-    }
+    c.as_dyn().common().description.clone()
 }
 
 /// Returns the password reference verbatim for an "unchanged" update.
 /// Variants without password support return `None`.
 pub(super) fn carry_password_ref(c: &Connection) -> Option<String> {
-    match c {
-        Connection::Postgres(p) => Some(p.password.clone()),
-        Connection::Mysql(m) => Some(m.password.clone()),
-        _ => None,
-    }
+    c.as_dyn().password().map(str::to_owned)
 }
 
 /// True when the variant carries a non-empty password and either:
 /// - it's a plaintext value (legacy), OR
 /// - it's a `{{keychain:…}}` reference whose entry actually exists.
 fn password_present(c: &Connection) -> bool {
-    let password = match c {
-        Connection::Postgres(p) => &p.password,
-        Connection::Mysql(m) => &m.password,
-        _ => return false,
+    let Some(password) = c.as_dyn().password() else {
+        return false;
     };
     if password.is_empty() {
         return false;
@@ -152,24 +100,17 @@ fn password_present(c: &Connection) -> bool {
 /// Convert a vault `Connection` into the public DTO that fronts the
 /// UI. No secrets — `has_password` replaces the actual reference.
 pub(super) fn to_public(name: &str, c: &Connection) -> ConnectionPublic {
-    let driver = driver_string_for(c).to_string();
-    let host = host_of(c);
-    let port = port_of(c);
-    let database_name = database_name_of(c);
-    let username = username_of(c);
-    let ssl_mode = ssl_mode_of(c);
-    let common = common_of(c);
-    let has_password = password_present(c);
-
+    let view = c.as_dyn();
+    let common = view.common();
     ConnectionPublic {
         name: name.to_string(),
-        driver,
-        host,
-        port,
-        database_name,
-        username,
-        has_password,
-        ssl_mode,
+        driver: view.driver().to_string(),
+        host: view.host().map(str::to_owned),
+        port: view.port(),
+        database_name: view.database_name().map(str::to_owned),
+        username: view.username().map(str::to_owned),
+        has_password: password_present(c),
+        ssl_mode: view.ssl_mode().map(str::to_owned),
         is_readonly: common.read_only,
         description: common.description.clone(),
     }
@@ -183,35 +124,27 @@ pub(super) fn to_public(name: &str, c: &Connection) -> ConnectionPublic {
 /// This adapter dies when the legacy `db::connections::Connection`
 /// shape is removed (post Epic 19 frontend cutover).
 pub(super) fn to_legacy(name: &str, c: &Connection) -> Result<LegacyConnection, String> {
-    let driver = driver_string_for(c).to_string();
-    let host = host_of(c);
-    let port = port_of(c).map(|p| p as i64);
-    let database_name = database_name_of(c);
-    let username = username_of(c);
-    let ssl_mode = ssl_mode_of(c);
-    let is_readonly = common_of(c).read_only;
-
-    let password = match c {
-        Connection::Postgres(p) => resolve_value(&p.password)?,
-        Connection::Mysql(m) => resolve_value(&m.password)?,
-        _ => None,
+    let view = c.as_dyn();
+    let password = match view.password() {
+        Some(raw) => resolve_value(raw)?,
+        None => None,
     };
 
     Ok(LegacyConnection {
         id: name.to_string(),
         name: name.to_string(),
-        driver,
-        host,
-        port,
-        database_name,
-        username,
+        driver: view.driver().to_string(),
+        host: view.host().map(str::to_owned),
+        port: view.port().map(|p| p as i64),
+        database_name: view.database_name().map(str::to_owned),
+        username: view.username().map(str::to_owned),
         password,
-        ssl_mode,
+        ssl_mode: view.ssl_mode().map(str::to_owned),
         timeout_ms: 10000,
         query_timeout_ms: 30000,
         ttl_seconds: 300,
         max_pool_size: 5,
-        is_readonly,
+        is_readonly: view.common().read_only,
         last_tested_at: None,
         created_at: String::new(),
         updated_at: String::new(),
@@ -224,7 +157,7 @@ mod tests {
     use super::*;
     use crate::db::keychain::{delete_secret, KEYCHAIN_TEST_LOCK};
     use crate::vault_config::connections::{
-        MysqlConfig, PostgresConfig, ShellConfig, SqliteConfig,
+        CommonFields, MysqlConfig, PostgresConfig, ShellConfig, SqliteConfig,
     };
     use crate::vault_config::secret_resolver::ensure_keychain_ref;
 
