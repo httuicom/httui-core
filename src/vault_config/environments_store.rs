@@ -751,6 +751,158 @@ BASE_URL = "http://localhost"
     }
 
     #[tokio::test]
+    async fn resolve_var_secret_round_trips_through_keychain() {
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("resolve-sec");
+        store.create_env(&env_name).await.unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "ADMIN_TOKEN".into(),
+                value: "real-secret-value".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        let resolved = store
+            .resolve_var(&env_name, "ADMIN_TOKEN")
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some("real-secret-value"));
+
+        // Cleanup
+        let _ = delete_secret(&env_var_key(&env_name, "ADMIN_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn resolve_var_secret_errors_when_keychain_entry_missing() {
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("missing-sec");
+        store.create_env(&env_name).await.unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "ORPHAN".into(),
+                value: "stored-then-deleted".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        // Delete the keychain entry behind the reference; the TOML
+        // still has the {{keychain:...}} reference.
+        let _ = delete_secret(&env_var_key(&env_name, "ORPHAN"));
+
+        let err = store
+            .resolve_var(&env_name, "ORPHAN")
+            .await
+            .expect_err("must surface missing-keychain as error");
+        assert!(err.contains("ORPHAN"), "error should name the var: {err}");
+    }
+
+    #[tokio::test]
+    async fn delete_var_secret_clears_keychain_entry() {
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("delsec");
+        store.create_env(&env_name).await.unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "kept-in-keychain".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        store.delete_var(&env_name, "TOKEN").await.unwrap();
+
+        // After delete, the var is gone AND the keychain entry is gone.
+        assert!(store.list_vars(&env_name).await.unwrap().is_empty());
+        assert!(crate::db::keychain::get_secret(&env_var_key(&env_name, "TOKEN"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_env_clears_keychain_for_every_secret() {
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("delenv-sec");
+        store.create_env(&env_name).await.unwrap();
+        for key in ["TOKEN_A", "TOKEN_B"] {
+            store
+                .set_var(SetVarInput {
+                    env_name: env_name.clone(),
+                    key: key.into(),
+                    value: format!("value-of-{key}"),
+                    is_secret: true,
+                })
+                .await
+                .unwrap();
+        }
+
+        store.delete_env(&env_name).await.unwrap();
+
+        // Every keychain entry from the deleted env is gone.
+        for key in ["TOKEN_A", "TOKEN_B"] {
+            assert!(crate::db::keychain::get_secret(&env_var_key(&env_name, key))
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn set_var_empty_key_errors() {
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("empty-key");
+        store.create_env(&env_name).await.unwrap();
+        let err = store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "   ".into(),
+                value: "x".into(),
+                is_secret: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("variable key"));
+    }
+
+    #[tokio::test]
+    async fn set_var_in_missing_env_errors() {
+        let (store, _t) = fresh_store();
+        let err = store
+            .set_var(SetVarInput {
+                env_name: "no-such-env".into(),
+                key: "X".into(),
+                value: "y".into(),
+                is_secret: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn set_active_env_empty_string_clears() {
+        let (store, _t) = fresh_store();
+        store.create_env("staging").await.unwrap();
+        store.set_active_env(Some("staging")).await.unwrap();
+        assert_eq!(
+            store.active_env().await.unwrap().as_deref(),
+            Some("staging")
+        );
+        // Empty / whitespace-only string clears active.
+        store.set_active_env(Some("   ")).await.unwrap();
+        assert!(store.active_env().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn list_envs_skips_dot_local_files() {
         let (store, t) = fresh_store();
         std::fs::create_dir_all(t.path().join("envs")).unwrap();
