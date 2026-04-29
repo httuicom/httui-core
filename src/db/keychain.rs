@@ -46,15 +46,42 @@ fn forced_failure() -> Option<String> {
     None
 }
 
+/// Test-only in-memory keychain: a process-wide `HashMap` that
+/// `store_secret`/`get_secret`/`delete_secret` route through when built
+/// with `cfg(test)`. Why this exists: on macOS the OS keychain prompts
+/// for the login password on every test run because `cargo test` rebuilds
+/// the test binary with a new hash and the "Always Allow" ACL is bound
+/// to the binary signature. The `keyring` crate's own `mock` backend is
+/// `EntryOnly` (each `Entry::new` returns a fresh credential with no
+/// shared store), so we need our own map for store/get to be symmetric.
+#[cfg(test)]
+static TEST_KEYCHAIN: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn with_test_keychain<R>(f: impl FnOnce(&mut std::collections::HashMap<String, String>) -> R) -> R {
+    let mut guard = TEST_KEYCHAIN.lock().expect("test keychain mutex poisoned");
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    f(map)
+}
+
 /// Store a secret in the OS keychain.
 pub fn store_secret(key: &str, value: &str) -> Result<(), String> {
     if let Some(err) = forced_failure() {
         return Err(err);
     }
-    let entry = Entry::new(SERVICE, key).map_err(|e| format!("Keychain error: {}", e))?;
-    entry
-        .set_password(value)
-        .map_err(|e| format!("Failed to store secret: {}", e))
+    #[cfg(test)]
+    {
+        with_test_keychain(|m| m.insert(key.to_string(), value.to_string()));
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    {
+        let entry = Entry::new(SERVICE, key).map_err(|e| format!("Keychain error: {}", e))?;
+        entry
+            .set_password(value)
+            .map_err(|e| format!("Failed to store secret: {}", e))
+    }
 }
 
 /// Retrieve a secret from the OS keychain.
@@ -62,11 +89,18 @@ pub fn get_secret(key: &str) -> Result<Option<String>, String> {
     if let Some(err) = forced_failure() {
         return Err(err);
     }
-    let entry = Entry::new(SERVICE, key).map_err(|e| format!("Keychain error: {}", e))?;
-    match entry.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("Failed to get secret: {}", e)),
+    #[cfg(test)]
+    {
+        return Ok(with_test_keychain(|m| m.get(key).cloned()));
+    }
+    #[cfg(not(test))]
+    {
+        let entry = Entry::new(SERVICE, key).map_err(|e| format!("Keychain error: {}", e))?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(format!("Failed to get secret: {}", e)),
+        }
     }
 }
 
@@ -75,11 +109,19 @@ pub fn delete_secret(key: &str) -> Result<(), String> {
     if let Some(err) = forced_failure() {
         return Err(err);
     }
-    let entry = Entry::new(SERVICE, key).map_err(|e| format!("Keychain error: {}", e))?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()), // already gone
-        Err(e) => Err(format!("Failed to delete secret: {}", e)),
+    #[cfg(test)]
+    {
+        with_test_keychain(|m| m.remove(key));
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    {
+        let entry = Entry::new(SERVICE, key).map_err(|e| format!("Keychain error: {}", e))?;
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()), // already gone
+            Err(e) => Err(format!("Failed to delete secret: {}", e)),
+        }
     }
 }
 
