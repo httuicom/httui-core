@@ -2,6 +2,7 @@ pub mod chat;
 pub mod connections;
 pub mod environments;
 pub mod keychain;
+pub mod lookup;
 pub mod schema_cache;
 
 use serde::Serialize;

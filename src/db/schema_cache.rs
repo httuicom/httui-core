@@ -275,7 +275,10 @@ mod tests {
         .await
         .unwrap();
 
-        let manager = Arc::new(PoolManager::new_standalone(app_pool.clone()));
+        let manager = Arc::new(PoolManager::new_standalone(
+            crate::db::lookup::SqliteLookup::new(app_pool.clone()),
+            app_pool.clone(),
+        ));
         (manager, app_pool, conn.id)
     }
 

@@ -160,6 +160,12 @@ pub struct UpdateConnection {
 // --- ConnectionManager ---
 
 pub struct PoolManager {
+    /// Resolves `Connection` records by name. File-backed in production
+    /// (`ConnectionsStore`); SQLite adapter in legacy tests
+    /// (`SqliteLookup`). See `db/lookup.rs`.
+    lookup: Arc<dyn super::lookup::ConnectionLookup>,
+    /// Retained only for `cleanup_query_log` (the `query_log` SQLite
+    /// table; Epic 20a Story 01 moves this out and the field with it).
     app_pool: SqlitePool,
     pools: RwLock<HashMap<String, PoolEntry>>,
     emitter: Option<Arc<dyn StatusEmitter>>,
@@ -174,8 +180,13 @@ struct PoolEntry {
 }
 
 impl PoolManager {
-    pub fn new_with_emitter(app_pool: SqlitePool, emitter: Arc<dyn StatusEmitter>) -> Self {
+    pub fn new_with_emitter(
+        lookup: Arc<dyn super::lookup::ConnectionLookup>,
+        app_pool: SqlitePool,
+        emitter: Arc<dyn StatusEmitter>,
+    ) -> Self {
         Self {
+            lookup,
             app_pool,
             pools: RwLock::new(HashMap::new()),
             emitter: Some(emitter),
@@ -183,8 +194,12 @@ impl PoolManager {
     }
 
     /// Create without event emitter (for MCP server and tests).
-    pub fn new_standalone(app_pool: SqlitePool) -> Self {
+    pub fn new_standalone(
+        lookup: Arc<dyn super::lookup::ConnectionLookup>,
+        app_pool: SqlitePool,
+    ) -> Self {
         Self {
+            lookup,
             app_pool,
             pools: RwLock::new(HashMap::new()),
             emitter: None,
@@ -205,8 +220,10 @@ impl PoolManager {
             }
         }
 
-        // Not cached — load connection and create pool
-        let conn = get_connection(&self.app_pool, connection_id)
+        // Not cached — resolve connection and create pool
+        let conn = self
+            .lookup
+            .lookup(connection_id)
             .await?
             .ok_or_else(|| format!("Connection '{}' not found", connection_id))?;
 
@@ -293,19 +310,21 @@ impl PoolManager {
     }
 
     pub async fn test_connection(&self, connection_id: &str) -> Result<(), String> {
-        let conn = get_connection(&self.app_pool, connection_id)
+        let conn = self
+            .lookup
+            .lookup(connection_id)
             .await?
             .ok_or_else(|| format!("Connection '{}' not found", connection_id))?;
 
         let pool = create_pool(&conn).await?;
         pool.test().await?;
 
-        // Update last_tested_at
-        sqlx::query("UPDATE connections SET last_tested_at = datetime('now') WHERE id = ?")
-            .bind(connection_id)
-            .execute(&self.app_pool)
-            .await
-            .map_err(|e| e.to_string())?;
+        // The legacy `UPDATE connections SET last_tested_at` write is
+        // dropped: the file-backed schema doesn't carry that field, and
+        // the live status emitter (`emit_connection_status`) is the
+        // user-facing signal anyway. Reintroduce as a per-machine cache
+        // (e.g. `~/.config/httui/connection_status.toml`) if a UI need
+        // emerges — out of scope for v1 (audit-015 Phase 3 decision).
 
         Ok(())
     }
@@ -2788,7 +2807,10 @@ mod tests {
         // task was designed to catch — a regression where invalidate
         // stops being called would leak stale config.
         let pool = setup_test_pool().await;
-        let manager = std::sync::Arc::new(PoolManager::new_standalone(pool.clone()));
+        let manager = std::sync::Arc::new(PoolManager::new_standalone(
+            super::super::lookup::SqliteLookup::new(pool.clone()),
+            pool.clone(),
+        ));
 
         let created = create_connection(
             &pool,
