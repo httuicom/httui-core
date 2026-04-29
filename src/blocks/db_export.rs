@@ -169,9 +169,7 @@ fn ident_or_quote(name: &str) -> String {
             .next()
             .map(|c| c.is_ascii_alphabetic() || c == '_')
             .unwrap_or(false)
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if valid {
         name.to_string()
     } else {
@@ -224,12 +222,8 @@ pub fn infer_table_name(sql: &str) -> Option<String> {
             cleaned[..abs].chars().last()
         };
         let after = cleaned[abs + 4..].chars().next();
-        let is_word_boundary_before = before
-            .map(|c| !is_ident_char(c))
-            .unwrap_or(true);
-        let is_word_boundary_after = after
-            .map(|c| !is_ident_char(c))
-            .unwrap_or(true);
+        let is_word_boundary_before = before.map(|c| !is_ident_char(c)).unwrap_or(true);
+        let is_word_boundary_after = after.map(|c| !is_ident_char(c)).unwrap_or(true);
         if is_word_boundary_before && is_word_boundary_after {
             // Skip whitespace, then read an identifier (optionally
             // dotted: schema.table).
@@ -318,7 +312,10 @@ mod tests {
     #[test]
     fn csv_emits_header_then_rows() {
         let c = cols(&["id", "name"]);
-        let rows = vec![json!({"id": 1, "name": "alice"}), json!({"id": 2, "name": "bob"})];
+        let rows = vec![
+            json!({"id": 1, "name": "alice"}),
+            json!({"id": 2, "name": "bob"}),
+        ];
         let csv = to_csv(&c, &rows);
         assert_eq!(csv, "id,name\n1,alice\n2,bob\n");
     }
@@ -327,7 +324,7 @@ mod tests {
     fn csv_quotes_fields_with_comma_quote_or_newline() {
         let c = cols(&["v"]);
         let rows = vec![
-            json!({"v": "a,b"}),       // comma → quoted
+            json!({"v": "a,b"}),             // comma → quoted
             json!({"v": "she said \"hi\""}), // quote → quoted + doubled
             json!({"v": "line1\nline2"}),    // newline → quoted
         ];
@@ -374,10 +371,7 @@ mod tests {
         let c = cols(&["id", "name"]);
         let rows = vec![json!({"id": 1, "name": "alice"})];
         let md = to_markdown(&c, &rows);
-        assert_eq!(
-            md,
-            "| id | name |\n| --- | --- |\n| 1 | alice |\n"
-        );
+        assert_eq!(md, "| id | name |\n| --- | --- |\n| 1 | alice |\n");
     }
 
     #[test]

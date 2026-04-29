@@ -147,7 +147,10 @@ mod tests {
         let outcome = migrate_from_candidates(&target, std::slice::from_ref(&legacy)).unwrap();
         assert!(matches!(&outcome, MigrationOutcome::Migrated { from } if from == &legacy));
 
-        assert_eq!(std::fs::read(target.join("notes.db")).unwrap(), b"legacy-data");
+        assert_eq!(
+            std::fs::read(target.join("notes.db")).unwrap(),
+            b"legacy-data"
+        );
         assert_eq!(std::fs::read(target.join("tmp/foo.png")).unwrap(), b"img");
         // legacy must remain intact (rollback safety)
         assert!(legacy.join("notes.db").exists());
@@ -186,8 +189,7 @@ mod tests {
         std::fs::create_dir_all(&populated).unwrap();
         std::fs::write(populated.join("notes.db"), b"data").unwrap();
 
-        let outcome =
-            migrate_from_candidates(&target, &[empty, populated.clone()]).unwrap();
+        let outcome = migrate_from_candidates(&target, &[empty, populated.clone()]).unwrap();
         match outcome {
             MigrationOutcome::Migrated { from } => assert_eq!(from, populated),
             other => panic!("expected Migrated, got {other:?}"),

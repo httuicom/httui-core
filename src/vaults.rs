@@ -110,7 +110,10 @@ mod tests {
             get_active_vault(&pool).await.unwrap(),
             Some("/notas".to_string())
         );
-        assert_eq!(list_vaults(&pool).await.unwrap(), vec!["/notas".to_string()]);
+        assert_eq!(
+            list_vaults(&pool).await.unwrap(),
+            vec!["/notas".to_string()]
+        );
     }
 
     #[tokio::test]

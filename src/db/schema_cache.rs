@@ -291,10 +291,12 @@ mod tests {
                     .execute(p)
                     .await
                     .unwrap();
-                sqlx::query("CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)")
-                    .execute(p)
-                    .await
-                    .unwrap();
+                sqlx::query(
+                    "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)",
+                )
+                .execute(p)
+                .await
+                .unwrap();
             }
             _ => panic!("Expected SQLite"),
         }
@@ -304,8 +306,12 @@ mod tests {
             .unwrap();
 
         assert!(entries.len() >= 6); // 3 columns per table
-        assert!(entries.iter().any(|e| e.table_name == "users" && e.column_name == "name"));
-        assert!(entries.iter().any(|e| e.table_name == "posts" && e.column_name == "title"));
+        assert!(entries
+            .iter()
+            .any(|e| e.table_name == "users" && e.column_name == "name"));
+        assert!(entries
+            .iter()
+            .any(|e| e.table_name == "posts" && e.column_name == "title"));
     }
 
     #[tokio::test]
@@ -338,8 +344,12 @@ mod tests {
             .unwrap()
             .expect("Should have cached schema");
 
-        assert!(cached.iter().any(|e| e.table_name == "items" && e.column_name == "id"));
-        assert!(cached.iter().any(|e| e.table_name == "items" && e.column_name == "val"));
+        assert!(cached
+            .iter()
+            .any(|e| e.table_name == "items" && e.column_name == "id"));
+        assert!(cached
+            .iter()
+            .any(|e| e.table_name == "items" && e.column_name == "val"));
     }
 
     #[tokio::test]

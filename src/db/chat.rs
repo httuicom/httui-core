@@ -83,28 +83,22 @@ fn row_to_tool_call(row: &sqlx::sqlite::SqliteRow) -> ToolCall {
 
 // ── Session CRUD ─────────────────────────────────────────────────────
 
-pub async fn create_session(
-    pool: &SqlitePool,
-    cwd: Option<String>,
-) -> Result<Session, String> {
-    let row = sqlx::query(
-        "INSERT INTO sessions (cwd) VALUES (?) RETURNING *",
-    )
-    .bind(&cwd)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| format!("Failed to create session: {e}"))?;
+pub async fn create_session(pool: &SqlitePool, cwd: Option<String>) -> Result<Session, String> {
+    let row = sqlx::query("INSERT INTO sessions (cwd) VALUES (?) RETURNING *")
+        .bind(&cwd)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("Failed to create session: {e}"))?;
 
     Ok(row_to_session(&row))
 }
 
 pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<Session>, String> {
-    let rows = sqlx::query(
-        "SELECT * FROM sessions WHERE archived_at IS NULL ORDER BY updated_at DESC",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("Failed to list sessions: {e}"))?;
+    let rows =
+        sqlx::query("SELECT * FROM sessions WHERE archived_at IS NULL ORDER BY updated_at DESC")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Failed to list sessions: {e}"))?;
 
     Ok(rows.iter().map(row_to_session).collect())
 }
@@ -130,7 +124,9 @@ pub async fn archive_session(pool: &SqlitePool, session_id: i64) -> Result<(), S
     .map_err(|e| format!("Failed to archive session: {e}"))?;
 
     if result.rows_affected() == 0 {
-        return Err(format!("Session {session_id} not found or already archived"));
+        return Err(format!(
+            "Session {session_id} not found or already archived"
+        ));
     }
     Ok(())
 }
@@ -207,17 +203,13 @@ pub async fn insert_message(
     Ok(row_to_message(&row))
 }
 
-pub async fn list_messages(
-    pool: &SqlitePool,
-    session_id: i64,
-) -> Result<Vec<Message>, String> {
-    let msg_rows = sqlx::query(
-        "SELECT * FROM messages WHERE session_id = ? ORDER BY turn_index ASC",
-    )
-    .bind(session_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("Failed to list messages: {e}"))?;
+pub async fn list_messages(pool: &SqlitePool, session_id: i64) -> Result<Vec<Message>, String> {
+    let msg_rows =
+        sqlx::query("SELECT * FROM messages WHERE session_id = ? ORDER BY turn_index ASC")
+            .bind(session_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Failed to list messages: {e}"))?;
 
     let message_ids: Vec<i64> = msg_rows.iter().map(|r| r.get("id")).collect();
 
@@ -226,7 +218,11 @@ pub async fn list_messages(
     }
 
     // Fetch all tool_calls for these messages in one query
-    let placeholders = message_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders = message_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let query_str = format!(
         "SELECT * FROM tool_calls WHERE message_id IN ({placeholders}) ORDER BY created_at ASC"
     );
@@ -240,7 +236,8 @@ pub async fn list_messages(
         .map_err(|e| format!("Failed to list tool_calls: {e}"))?;
 
     // Group tool_calls by message_id
-    let mut tc_map: std::collections::HashMap<i64, Vec<ToolCall>> = std::collections::HashMap::new();
+    let mut tc_map: std::collections::HashMap<i64, Vec<ToolCall>> =
+        std::collections::HashMap::new();
     for row in &tc_rows {
         let msg_id: i64 = row.get("message_id");
         tc_map
@@ -340,7 +337,7 @@ pub async fn check_permission(
     let row = sqlx::query(
         "SELECT * FROM tool_permissions WHERE tool_name = ? AND scope = 'always' \
          AND (workspace = ? OR workspace IS NULL) \
-         ORDER BY CASE WHEN workspace IS NOT NULL THEN 0 ELSE 1 END LIMIT 1"
+         ORDER BY CASE WHEN workspace IS NOT NULL THEN 0 ELSE 1 END LIMIT 1",
     )
     .bind(tool_name)
     .bind(workspace)
@@ -355,7 +352,7 @@ pub async fn check_permission(
     // 2. Check 'session' rules
     let row = sqlx::query(
         "SELECT * FROM tool_permissions WHERE tool_name = ? AND scope = 'session' \
-         AND session_id = ? LIMIT 1"
+         AND session_id = ? LIMIT 1",
     )
     .bind(tool_name)
     .bind(session_id)
@@ -408,7 +405,7 @@ pub async fn list_permissions(
     let rows = if let Some(ws) = workspace {
         sqlx::query(
             "SELECT * FROM tool_permissions WHERE (workspace = ? OR workspace IS NULL) \
-             ORDER BY created_at DESC"
+             ORDER BY created_at DESC",
         )
         .bind(ws)
         .fetch_all(pool)
@@ -423,10 +420,7 @@ pub async fn list_permissions(
     Ok(rows.iter().map(row_to_permission).collect())
 }
 
-pub async fn clear_session_permissions(
-    pool: &SqlitePool,
-    session_id: i64,
-) -> Result<(), String> {
+pub async fn clear_session_permissions(pool: &SqlitePool, session_id: i64) -> Result<(), String> {
     sqlx::query("DELETE FROM tool_permissions WHERE scope = 'session' AND session_id = ?")
         .bind(session_id)
         .execute(pool)
@@ -479,7 +473,7 @@ pub async fn get_usage_by_date_range(
         "SELECT date, SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens, \
          SUM(cache_read_tokens) as cache_read_tokens \
          FROM usage_stats WHERE date >= ? AND date <= ? \
-         GROUP BY date ORDER BY date ASC"
+         GROUP BY date ORDER BY date ASC",
     )
     .bind(from)
     .bind(to)

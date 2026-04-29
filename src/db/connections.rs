@@ -280,11 +280,9 @@ impl PoolManager {
 
     /// Delete query_log entries older than 30 days or exceeding 50k rows.
     pub async fn cleanup_query_log(&self) {
-        let _ = sqlx::query(
-            "DELETE FROM query_log WHERE created_at < datetime('now', '-30 days')",
-        )
-        .execute(&self.app_pool)
-        .await;
+        let _ = sqlx::query("DELETE FROM query_log WHERE created_at < datetime('now', '-30 days')")
+            .execute(&self.app_pool)
+            .await;
 
         // Cap at 50k entries — delete oldest beyond that
         let _ = sqlx::query(
@@ -315,9 +313,7 @@ impl PoolManager {
 
 // --- Pool creation ---
 
-fn build_pg_connect_options(
-    conn: &Connection,
-) -> Result<sqlx::postgres::PgConnectOptions, String> {
+fn build_pg_connect_options(conn: &Connection) -> Result<sqlx::postgres::PgConnectOptions, String> {
     use super::keychain::{conn_password_key, resolve_value, KEYCHAIN_SENTINEL};
     use sqlx::postgres::{PgConnectOptions, PgSslMode};
 
@@ -511,7 +507,10 @@ pub fn sanitize_query_error_rich(e: &sqlx::Error) -> QueryErrorInfo {
         sqlx::Error::Database(db_err) => {
             let msg = format!("Query failed: {}", db_err.message());
             let location = extract_error_location(db_err.as_ref());
-            QueryErrorInfo { message: msg, location }
+            QueryErrorInfo {
+                message: msg,
+                location,
+            }
         }
         _ => QueryErrorInfo {
             message: "Query failed".to_string(),
@@ -586,10 +585,7 @@ fn mysql_line_from_message(msg: &str) -> Option<u32> {
 /// After capture, resolve Postgres-style raw byte position into (line, col)
 /// using the query text the executor sent. MySQL line (already extracted
 /// from the message) passes through unchanged.
-pub fn enrich_error_with_query(
-    info: &mut QueryErrorInfo,
-    query: &str,
-) {
+pub fn enrich_error_with_query(info: &mut QueryErrorInfo, query: &str) {
     if info.location.line.is_none() {
         if let Some(pos) = info.location.column {
             let (l, c) = position_to_line_col(query, pos);
@@ -679,7 +675,10 @@ fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
         ttl_seconds: row.get("ttl_seconds"),
         max_pool_size: row.get("max_pool_size"),
         // is_readonly stored as INTEGER (0/1) in SQLite
-        is_readonly: row.try_get::<i64, _>("is_readonly").map(|v| v != 0).unwrap_or(false),
+        is_readonly: row
+            .try_get::<i64, _>("is_readonly")
+            .map(|v| v != 0)
+            .unwrap_or(false),
         last_tested_at: row.get("last_tested_at"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -705,10 +704,7 @@ pub async fn list_connections(pool: &SqlitePool) -> Result<Vec<Connection>, Stri
     Ok(rows.iter().map(row_to_connection).collect())
 }
 
-pub async fn get_connection(
-    pool: &SqlitePool,
-    id: &str,
-) -> Result<Option<Connection>, String> {
+pub async fn get_connection(pool: &SqlitePool, id: &str) -> Result<Option<Connection>, String> {
     let row = sqlx::query(
         r#"SELECT
             id, name, driver, host, port, database_name, username, password,
@@ -729,7 +725,12 @@ pub async fn create_connection(
     pool: &SqlitePool,
     input: CreateConnection,
 ) -> Result<Connection, String> {
-    validate_connection_fields(&input.driver, &input.host, &input.port, &input.database_name)?;
+    validate_connection_fields(
+        &input.driver,
+        &input.host,
+        &input.port,
+        &input.database_name,
+    )?;
 
     let id = Uuid::new_v4().to_string();
     let ssl_mode = input.ssl_mode.unwrap_or_else(|| "prefer".to_string());
@@ -976,25 +977,24 @@ impl DatabasePool {
 
         // T09: Restrict EXPLAIN ANALYZE with mutation keywords
         if trimmed.starts_with("EXPLAIN")
-            && (trimmed.contains("ANALYZE") || trimmed.contains("ANALYSE")) {
-                let after_explain = trimmed
-                    .trim_start_matches("EXPLAIN")
-                    .trim()
-                    .trim_start_matches("ANALYZE")
-                    .trim_start_matches("ANALYSE")
-                    .trim_start();
-                let mutation_keywords = [
-                    "DELETE", "UPDATE", "INSERT", "DROP", "ALTER", "TRUNCATE",
-                ];
-                if mutation_keywords
-                    .iter()
-                    .any(|kw| after_explain.starts_with(kw))
-                {
-                    return Err(plain_err(
-                        "EXPLAIN ANALYZE with mutation statements is not allowed".to_string(),
-                    ));
-                }
+            && (trimmed.contains("ANALYZE") || trimmed.contains("ANALYSE"))
+        {
+            let after_explain = trimmed
+                .trim_start_matches("EXPLAIN")
+                .trim()
+                .trim_start_matches("ANALYZE")
+                .trim_start_matches("ANALYSE")
+                .trim_start();
+            let mutation_keywords = ["DELETE", "UPDATE", "INSERT", "DROP", "ALTER", "TRUNCATE"];
+            if mutation_keywords
+                .iter()
+                .any(|kw| after_explain.starts_with(kw))
+            {
+                return Err(plain_err(
+                    "EXPLAIN ANALYZE with mutation statements is not allowed".to_string(),
+                ));
             }
+        }
 
         let is_select = if trimmed.starts_with("PRAGMA") {
             // PRAGMA with = is a write operation (e.g. PRAGMA journal_mode=WAL)
@@ -1008,7 +1008,8 @@ impl DatabasePool {
         };
 
         if is_select {
-            self.execute_select(sql, bind_values, offset, fetch_size).await
+            self.execute_select(sql, bind_values, offset, fetch_size)
+                .await
         } else {
             self.execute_mutation(sql, bind_values).await
         }
@@ -1112,10 +1113,7 @@ async fn execute_select_sqlite(
         Vec::new()
     };
 
-    let json_rows: Vec<JsonRow> = rows
-        .iter()
-        .map(sqlite_row_to_json)
-        .collect();
+    let json_rows: Vec<JsonRow> = rows.iter().map(sqlite_row_to_json).collect();
 
     Ok(QueryResult {
         columns,
@@ -1528,7 +1526,9 @@ fn decode_mysql_by_type(
             }
         }
         "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" | "VARBINARY" | "GEOMETRY"
-        | "BIT" => serde_json::Value::String(BASE64_STANDARD.encode(mysql_get::<Vec<u8>>(row, idx)?)),
+        | "BIT" => {
+            serde_json::Value::String(BASE64_STANDARD.encode(mysql_get::<Vec<u8>>(row, idx)?))
+        }
         "NULL" => serde_json::Value::Null,
         _ => return None,
     })
@@ -1539,21 +1539,16 @@ fn decode_mysql_by_type(
 // already been ruled out by the caller, so we try the two most permissive
 // sqlx decoders and, as a last resort, emit a tagged marker so the user knows
 // a value exists but couldn't be interpreted.
-fn mysql_fallback_decode(
-    row: &sqlx::mysql::MySqlRow,
-    idx: usize,
-    ty: &str,
-) -> serde_json::Value {
+fn mysql_fallback_decode(row: &sqlx::mysql::MySqlRow, idx: usize, ty: &str) -> serde_json::Value {
     if let Some(s) = mysql_get::<String>(row, idx) {
         return serde_json::Value::String(s);
     }
     if let Some(bytes) = mysql_get::<Vec<u8>>(row, idx) {
         return match std::str::from_utf8(&bytes) {
             Ok(s) => serde_json::Value::String(s.to_string()),
-            Err(_) => serde_json::Value::String(format!(
-                "base64:{}",
-                BASE64_STANDARD.encode(&bytes)
-            )),
+            Err(_) => {
+                serde_json::Value::String(format!("base64:{}", BASE64_STANDARD.encode(&bytes)))
+            }
         };
     }
     serde_json::Value::String(format!("<unable to decode {}>", ty))
@@ -1963,7 +1958,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_postgres_requires_host() {
-        let result = validate_connection_fields("postgres", &None, &Some(5432), &Some("db".to_string()));
+        let result =
+            validate_connection_fields("postgres", &None, &Some(5432), &Some("db".to_string()));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("host is required"));
     }
@@ -2078,10 +2074,12 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("INSERT INTO test_table VALUES (1, 'alpha', 1.5), (2, 'beta', 2.5), (3, 'gamma', 3.5)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO test_table VALUES (1, 'alpha', 1.5), (2, 'beta', 2.5), (3, 'gamma', 3.5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let db_pool = DatabasePool::Sqlite(pool);
         let result = db_pool
@@ -2144,12 +2142,7 @@ mod tests {
 
         let db_pool = DatabasePool::Sqlite(pool);
         let result = db_pool
-            .execute_query(
-                "INSERT INTO items VALUES (1, 'test')",
-                &[],
-                1,
-                100,
-            )
+            .execute_query("INSERT INTO items VALUES (1, 'test')", &[], 1, 100)
             .await
             .unwrap();
 
@@ -2283,7 +2276,10 @@ mod tests {
         };
         assert!(validate_pool_config(&conn).is_err());
 
-        let conn2 = Connection { port: Some(70000), ..conn };
+        let conn2 = Connection {
+            port: Some(70000),
+            ..conn
+        };
         assert!(validate_pool_config(&conn2).is_err());
     }
 
@@ -2328,7 +2324,9 @@ mod tests {
 
     #[test]
     fn test_allow_semicolon_in_string() {
-        assert!(!contains_multiple_statements("SELECT * FROM t WHERE v = 'a;b'"));
+        assert!(!contains_multiple_statements(
+            "SELECT * FROM t WHERE v = 'a;b'"
+        ));
     }
 
     #[test]
@@ -2347,10 +2345,7 @@ mod tests {
     fn test_split_single_statement() {
         assert_eq!(split_statements("SELECT 1"), vec!["SELECT 1"]);
         assert_eq!(split_statements("SELECT 1;"), vec!["SELECT 1"]);
-        assert_eq!(
-            split_statements("  SELECT 1  ;  "),
-            vec!["SELECT 1"]
-        );
+        assert_eq!(split_statements("  SELECT 1  ;  "), vec!["SELECT 1"]);
     }
 
     #[test]
@@ -2367,9 +2362,7 @@ mod tests {
 
     #[test]
     fn test_split_skips_line_and_block_comments() {
-        let r = split_statements(
-            "SELECT 1 -- ; here\n; SELECT 2 /* ; inside */; SELECT 3",
-        );
+        let r = split_statements("SELECT 1 -- ; here\n; SELECT 2 /* ; inside */; SELECT 3");
         assert_eq!(
             r,
             vec![
@@ -2456,7 +2449,10 @@ mod tests {
     #[tokio::test]
     async fn test_explain_analyze_delete_rejected() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE t (id INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let db_pool = DatabasePool::Sqlite(pool);
         let result = db_pool
             .execute_query("EXPLAIN ANALYZE DELETE FROM t", &[], 0, 100)
@@ -2471,28 +2467,43 @@ mod tests {
         // SQLite can't subquery-wrap EXPLAIN output, so it may fail at execution,
         // but the error must NOT be our security rejection.
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE t (id INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let db_pool = DatabasePool::Sqlite(pool);
         let result = db_pool
             .execute_query("EXPLAIN SELECT * FROM t", &[], 0, 100)
             .await;
         if let Err(ref e) = result {
-            assert!(!e.contains("EXPLAIN ANALYZE"), "Should not be blocked by security check");
-            assert!(!e.contains("Multi-statement"), "Should not be blocked by multi-statement check");
+            assert!(
+                !e.contains("EXPLAIN ANALYZE"),
+                "Should not be blocked by security check"
+            );
+            assert!(
+                !e.contains("Multi-statement"),
+                "Should not be blocked by multi-statement check"
+            );
         }
     }
 
     #[tokio::test]
     async fn test_explain_analyze_select_not_blocked() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE t (id INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let db_pool = DatabasePool::Sqlite(pool);
         let result = db_pool
             .execute_query("EXPLAIN ANALYZE SELECT * FROM t", &[], 0, 100)
             .await;
         // May fail at execution level, but must NOT be our security rejection
         if let Err(ref e) = result {
-            assert!(!e.contains("mutation"), "SELECT should not be blocked as mutation");
+            assert!(
+                !e.contains("mutation"),
+                "SELECT should not be blocked as mutation"
+            );
         }
     }
 
@@ -2539,24 +2550,36 @@ mod tests {
 
     #[test]
     fn test_count_placeholders_ignores_string() {
-        assert_eq!(count_placeholders("SELECT * FROM t WHERE v = '?' AND id = ?"), 1);
+        assert_eq!(
+            count_placeholders("SELECT * FROM t WHERE v = '?' AND id = ?"),
+            1
+        );
     }
 
     #[test]
     fn test_count_placeholders_ignores_comments() {
         assert_eq!(count_placeholders("SELECT * -- ?\nFROM t WHERE id = ?"), 1);
-        assert_eq!(count_placeholders("SELECT /* ? */ * FROM t WHERE id = ?"), 1);
+        assert_eq!(
+            count_placeholders("SELECT /* ? */ * FROM t WHERE id = ?"),
+            1
+        );
     }
 
     #[test]
     fn test_count_placeholders_multiple() {
-        assert_eq!(count_placeholders("SELECT * FROM t WHERE a = ? AND b = ? AND c = ?"), 3);
+        assert_eq!(
+            count_placeholders("SELECT * FROM t WHERE a = ? AND b = ? AND c = ?"),
+            3
+        );
     }
 
     #[tokio::test]
     async fn test_multi_statement_rejected_in_execute() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE t (id INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let db_pool = DatabasePool::Sqlite(pool);
         let result = db_pool
             .execute_query("SELECT 1; DROP TABLE t", &[], 0, 100)
@@ -2626,7 +2649,11 @@ mod tests {
         let result = db_pool
             .execute_query(
                 "SELECT * FROM t WHERE a = ?",
-                &[serde_json::json!(1), serde_json::json!(2), serde_json::json!(3)],
+                &[
+                    serde_json::json!(1),
+                    serde_json::json!(2),
+                    serde_json::json!(3),
+                ],
                 0,
                 100,
             )
@@ -2672,9 +2699,7 @@ mod tests {
         // connection row must NOT be inserted with a plaintext password.
         // We force the keychain to error and verify both the Err return
         // AND that no row leaked into the database.
-        use crate::db::keychain::{
-            force_keychain_failure, KEYCHAIN_TEST_LOCK,
-        };
+        use crate::db::keychain::{force_keychain_failure, KEYCHAIN_TEST_LOCK};
 
         let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
         let pool = setup_test_pool().await;
@@ -2791,10 +2816,7 @@ mod tests {
         let id = created.id.clone();
 
         // First get_pool: pool is created and cached with timeout=10000.
-        let pool_a = manager
-            .get_pool(&id)
-            .await
-            .expect("get_pool must succeed");
+        let pool_a = manager.get_pool(&id).await.expect("get_pool must succeed");
         assert_eq!(manager.get_query_timeout(&id).await, Some(10000));
 
         // Update the row's query_timeout_ms in the database.

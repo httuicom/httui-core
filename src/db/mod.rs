@@ -10,7 +10,9 @@ use sqlx::{Column, Row, TypeInfo};
 use std::path::Path;
 use std::str::FromStr;
 
-use connections::{contains_multiple_statements, sanitize_query_error, sqlite_row_to_json, ColumnInfo, JsonRow};
+use connections::{
+    contains_multiple_statements, sanitize_query_error, sqlite_row_to_json, ColumnInfo, JsonRow,
+};
 
 const MIGRATION_SQL: &str = include_str!("../../migrations/001_initial.sql");
 const MIGRATION_002_SQL: &str = include_str!("../../migrations/002_env_is_secret.sql");

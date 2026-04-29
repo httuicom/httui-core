@@ -124,19 +124,15 @@ impl DbExecutor {
                                     serde_json::Value::Object(obj)
                                 })
                                 .collect();
-                            results.push(
-                                crate::executor::db::types::DbResult::Select {
-                                    columns: r.columns,
-                                    rows,
-                                    has_more: r.has_more,
-                                },
-                            );
+                            results.push(crate::executor::db::types::DbResult::Select {
+                                columns: r.columns,
+                                rows,
+                                has_more: r.has_more,
+                            });
                         } else {
-                            results.push(
-                                crate::executor::db::types::DbResult::Mutation {
-                                    rows_affected: r.rows_affected.unwrap_or(0),
-                                },
-                            );
+                            results.push(crate::executor::db::types::DbResult::Mutation {
+                                rows_affected: r.rows_affected.unwrap_or(0),
+                            });
                         }
                     }
                     Err(mut info) => {
@@ -145,17 +141,12 @@ impl DbExecutor {
                         // can see what's right even when one piece is wrong.
                         // Resolve Postgres byte-position → (line, column) now
                         // that we know which statement text applies.
-                        crate::db::connections::enrich_error_with_query(
-                            &mut info,
-                            stmt,
-                        );
-                        results.push(
-                            crate::executor::db::types::DbResult::Error {
-                                message: info.message,
-                                line: info.location.line,
-                                column: info.location.column,
-                            },
-                        );
+                        crate::db::connections::enrich_error_with_query(&mut info, stmt);
+                        results.push(crate::executor::db::types::DbResult::Error {
+                            message: info.message,
+                            line: info.location.line,
+                            column: info.location.column,
+                        });
                     }
                 }
             }
@@ -245,9 +236,8 @@ impl Executor for DbExecutor {
             .await?;
 
         let duration_ms = response.stats.elapsed_ms;
-        let data = serde_json::to_value(&response).map_err(|e| {
-            ExecutorError(format!("Failed to serialize DB response: {e}"))
-        })?;
+        let data = serde_json::to_value(&response)
+            .map_err(|e| ExecutorError(format!("Failed to serialize DB response: {e}")))?;
 
         Ok(BlockResult {
             status: "success".to_string(),

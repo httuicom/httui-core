@@ -341,8 +341,8 @@ async fn build_request(
     };
 
     let raw_url = trim_str(&p.url);
-    let mut url = reqwest::Url::parse(&raw_url)
-        .map_err(|e| ExecutorError(format!("Invalid URL: {e}")))?;
+    let mut url =
+        reqwest::Url::parse(&raw_url).map_err(|e| ExecutorError(format!("Invalid URL: {e}")))?;
 
     if encode_values {
         // Default: percent-encode keys/values via the safe API.
@@ -351,7 +351,8 @@ async fn build_request(
             if key.is_empty() {
                 continue;
             }
-            url.query_pairs_mut().append_pair(&key, &trim_str(&kv.value));
+            url.query_pairs_mut()
+                .append_pair(&key, &trim_str(&kv.value));
         }
     } else {
         // Opt-out: append raw query string. Caller is responsible for any
@@ -448,16 +449,14 @@ async fn build_request(
                             filename,
                             content_type: ct,
                         } => {
-                            let bytes =
-                                read_file_with_cancel(&path, cancel).await?;
+                            let bytes = read_file_with_cancel(&path, cancel).await?;
                             // Build the Part once, then optionally apply the
                             // mime override. `mime_str` consumes Part on
                             // success — we keep the original via clone of
                             // the cheap shared bytes when we have to retry.
                             let bytes_for_fallback = bytes.clone();
                             let filename_for_fallback = filename.clone();
-                            let part = reqwest::multipart::Part::bytes(bytes)
-                                .file_name(filename);
+                            let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
                             let part = part.mime_str(&ct).unwrap_or_else(|_| {
                                 reqwest::multipart::Part::bytes(bytes_for_fallback)
                                     .file_name(filename_for_fallback)
@@ -507,7 +506,11 @@ enum Part {
 /// lowercase. Used purely to dispatch the body shape — not to pick what
 /// reqwest sees on the wire.
 fn content_type_main(ct: &str) -> String {
-    ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+    ct.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 const FILE_PREFIX: &str = "< ";
@@ -534,7 +537,9 @@ fn interpret_body(content_type: &str, body: &str) -> InterpretedBody {
         if let Some(path) = trimmed.strip_prefix(FILE_PREFIX) {
             let path = path.trim();
             if !path.is_empty() && trimmed.lines().filter(|l| !l.trim().is_empty()).count() == 1 {
-                return InterpretedBody::Binary { path: PathBuf::from(path) };
+                return InterpretedBody::Binary {
+                    path: PathBuf::from(path),
+                };
             }
         }
         // Binary content type but body isn't a `< /path` line — fall through
@@ -696,10 +701,7 @@ impl Executor for HttpExecutor {
         Ok(())
     }
 
-    async fn execute(
-        &self,
-        params: serde_json::Value,
-    ) -> Result<BlockResult, ExecutorError> {
+    async fn execute(&self, params: serde_json::Value) -> Result<BlockResult, ExecutorError> {
         // Backward-compatible path: call the cancel-aware impl with a never-
         // cancelled token and convert the typed shape to BlockResult.
         let response = self
@@ -868,9 +870,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/slow"))
-            .respond_with(
-                ResponseTemplate::new(200).set_delay(Duration::from_secs(60)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
             .mount(&server)
             .await;
 
@@ -884,7 +884,10 @@ mod tests {
         let result = executor.execute(params).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("[timeout]"), "Error should be classified as timeout: {err}");
+        assert!(
+            err.contains("[timeout]"),
+            "Error should be classified as timeout: {err}"
+        );
     }
 
     #[tokio::test]
@@ -955,9 +958,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/slow"))
-            .respond_with(
-                ResponseTemplate::new(200).set_delay(Duration::from_secs(60)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
             .mount(&server)
             .await;
 
@@ -1043,8 +1044,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/echo"))
             .respond_with(
-                ResponseTemplate::new(201)
-                    .set_body_json(serde_json::json!({"received": "yes"})),
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"received": "yes"})),
             )
             .mount(&server)
             .await;
@@ -1126,9 +1126,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/start"))
-            .respond_with(
-                ResponseTemplate::new(302).insert_header("location", "/elsewhere"),
-            )
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/elsewhere"))
             .mount(&server)
             .await;
 
@@ -1252,7 +1250,12 @@ mod tests {
             other => panic!("expected Text, got {other:?}"),
         }
         match &parts[1] {
-            Part::File { name, path, filename, content_type } => {
+            Part::File {
+                name,
+                path,
+                filename,
+                content_type,
+            } => {
                 assert_eq!(name, "avatar");
                 assert_eq!(path, &PathBuf::from("/tmp/avatar.png"));
                 assert_eq!(filename, "avatar.png");
@@ -1266,8 +1269,7 @@ mod tests {
     fn parse_multipart_textual_skips_disabled_parts() {
         // Disabled rows (prefixed with `#`) and free-form comments are
         // dropped — they exist only for the user's reference in the .md.
-        let body =
-            "name=alice\n# secret=hidden\n# this is a free-form comment\n# desc: foo";
+        let body = "name=alice\n# secret=hidden\n# this is a free-form comment\n# desc: foo";
         let parts = parse_multipart_textual(body);
         assert_eq!(parts.len(), 1);
         match &parts[0] {
@@ -1327,7 +1329,9 @@ mod tests {
                 "content-type",
                 "application/octet-stream",
             ))
-            .and(wiremock::matchers::body_bytes(b"\x89PNG\r\n\x1a\n".to_vec()))
+            .and(wiremock::matchers::body_bytes(
+                b"\x89PNG\r\n\x1a\n".to_vec(),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
             .mount(&server)
             .await;
@@ -1350,8 +1354,8 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_body_uploads_with_file_part() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let server = MockServer::start().await;
 
@@ -1450,9 +1454,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/stream"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string("hello world"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello world"))
             .mount(&server)
             .await;
 
@@ -1592,7 +1594,9 @@ mod tests {
 
         let (buf, cb) = capture_chunks();
         let result = executor.execute_streamed(params, token, cb).await;
-        let err = result.expect_err("cancel must surface as error").to_string();
+        let err = result
+            .expect_err("cancel must surface as error")
+            .to_string();
         assert_eq!(err, "Request cancelled");
 
         let chunks = buf.lock().unwrap();
@@ -1663,10 +1667,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/legacy"))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_body_json(serde_json::json!({"ok": true})),
-            )
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"ok": true})))
             .mount(&server)
             .await;
 

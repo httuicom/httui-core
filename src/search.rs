@@ -163,7 +163,11 @@ fn collect_md_files_for_index(
         if path.is_dir() {
             collect_md_files_for_index(&path, root, files)?;
         } else if name.ends_with(".md") {
-            let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
             let content = std::fs::read_to_string(&path).unwrap_or_default();
             let title = name.trim_end_matches(".md").to_string();
             files.push((relative, title, content));
@@ -227,10 +231,7 @@ pub async fn search_content(
 
     Ok(rows
         .into_iter()
-        .map(|(file_path, snippet)| ContentSearchResult {
-            file_path,
-            snippet,
-        })
+        .map(|(file_path, snippet)| ContentSearchResult { file_path, snippet })
         .collect())
 }
 

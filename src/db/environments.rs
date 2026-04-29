@@ -1,7 +1,7 @@
+use super::keychain;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
-use super::keychain;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Environment {
@@ -95,10 +95,7 @@ pub async fn list_environments(pool: &SqlitePool) -> Result<Vec<Environment>, St
     Ok(rows.iter().map(row_to_environment).collect())
 }
 
-pub async fn create_environment(
-    pool: &SqlitePool,
-    name: String,
-) -> Result<Environment, String> {
+pub async fn create_environment(pool: &SqlitePool, name: String) -> Result<Environment, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("Environment name is required".to_string());
@@ -202,10 +199,7 @@ pub async fn duplicate_environment(
     Ok(new_env)
 }
 
-pub async fn set_active_environment(
-    pool: &SqlitePool,
-    id: Option<&str>,
-) -> Result<(), String> {
+pub async fn set_active_environment(pool: &SqlitePool, id: Option<&str>) -> Result<(), String> {
     // Deactivate all
     sqlx::query("UPDATE environments SET is_active = 0")
         .execute(pool)
@@ -232,13 +226,11 @@ pub async fn list_env_variables(
     pool: &SqlitePool,
     environment_id: &str,
 ) -> Result<Vec<EnvVariable>, String> {
-    let rows = sqlx::query(
-        "SELECT * FROM env_variables WHERE environment_id = ? ORDER BY key ASC",
-    )
-    .bind(environment_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("Failed to list variables: {e}"))?;
+    let rows = sqlx::query("SELECT * FROM env_variables WHERE environment_id = ? ORDER BY key ASC")
+        .bind(environment_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("Failed to list variables: {e}"))?;
 
     Ok(rows.iter().map(row_to_variable).collect())
 }
@@ -265,14 +257,12 @@ pub async fn set_env_variable(
     };
 
     // Upsert: try update first, then insert
-    let existing = sqlx::query(
-        "SELECT id FROM env_variables WHERE environment_id = ? AND key = ?",
-    )
-    .bind(environment_id)
-    .bind(&key)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("Failed to check existing variable: {e}"))?;
+    let existing = sqlx::query("SELECT id FROM env_variables WHERE environment_id = ? AND key = ?")
+        .bind(environment_id)
+        .bind(&key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("Failed to check existing variable: {e}"))?;
 
     let var_id = if let Some(row) = existing {
         let id: String = row.get("id");
@@ -359,11 +349,15 @@ mod tests {
         let envs = list_environments(&pool).await.unwrap();
         assert!(envs.is_empty());
 
-        let env = create_environment(&pool, "local".to_string()).await.unwrap();
+        let env = create_environment(&pool, "local".to_string())
+            .await
+            .unwrap();
         assert_eq!(env.name, "local");
         assert!(!env.is_active);
 
-        create_environment(&pool, "staging".to_string()).await.unwrap();
+        create_environment(&pool, "staging".to_string())
+            .await
+            .unwrap();
 
         let envs = list_environments(&pool).await.unwrap();
         assert_eq!(envs.len(), 2);
@@ -380,8 +374,12 @@ mod tests {
     async fn test_set_active_environment() {
         let (_tmp, pool) = setup().await;
 
-        let env1 = create_environment(&pool, "local".to_string()).await.unwrap();
-        let env2 = create_environment(&pool, "staging".to_string()).await.unwrap();
+        let env1 = create_environment(&pool, "local".to_string())
+            .await
+            .unwrap();
+        let env2 = create_environment(&pool, "staging".to_string())
+            .await
+            .unwrap();
 
         set_active_environment(&pool, Some(&env1.id)).await.unwrap();
         let envs = list_environments(&pool).await.unwrap();
@@ -404,10 +402,20 @@ mod tests {
     async fn test_env_variables_crud() {
         let (_tmp, pool) = setup().await;
 
-        let env = create_environment(&pool, "local".to_string()).await.unwrap();
+        let env = create_environment(&pool, "local".to_string())
+            .await
+            .unwrap();
 
         // Create
-        let var = set_env_variable(&pool, &env.id, "BASE_URL".to_string(), "http://localhost:3000".to_string(), false).await.unwrap();
+        let var = set_env_variable(
+            &pool,
+            &env.id,
+            "BASE_URL".to_string(),
+            "http://localhost:3000".to_string(),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(var.key, "BASE_URL");
         assert_eq!(var.value, "http://localhost:3000");
 
@@ -416,7 +424,15 @@ mod tests {
         assert_eq!(vars.len(), 1);
 
         // Upsert (update existing key)
-        let updated = set_env_variable(&pool, &env.id, "BASE_URL".to_string(), "http://localhost:8080".to_string(), false).await.unwrap();
+        let updated = set_env_variable(
+            &pool,
+            &env.id,
+            "BASE_URL".to_string(),
+            "http://localhost:8080".to_string(),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(updated.id, var.id); // same id
         assert_eq!(updated.value, "http://localhost:8080");
 
@@ -433,26 +449,54 @@ mod tests {
     async fn test_duplicate_environment() {
         let (_tmp, pool) = setup().await;
 
-        let env = create_environment(&pool, "local".to_string()).await.unwrap();
-        set_env_variable(&pool, &env.id, "API_KEY".to_string(), "secret123".to_string(), false).await.unwrap();
-        set_env_variable(&pool, &env.id, "BASE_URL".to_string(), "http://localhost".to_string(), false).await.unwrap();
+        let env = create_environment(&pool, "local".to_string())
+            .await
+            .unwrap();
+        set_env_variable(
+            &pool,
+            &env.id,
+            "API_KEY".to_string(),
+            "secret123".to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        set_env_variable(
+            &pool,
+            &env.id,
+            "BASE_URL".to_string(),
+            "http://localhost".to_string(),
+            false,
+        )
+        .await
+        .unwrap();
 
-        let dup = duplicate_environment(&pool, &env.id, "staging".to_string()).await.unwrap();
+        let dup = duplicate_environment(&pool, &env.id, "staging".to_string())
+            .await
+            .unwrap();
         assert_eq!(dup.name, "staging");
         assert_ne!(dup.id, env.id);
 
         let dup_vars = list_env_variables(&pool, &dup.id).await.unwrap();
         assert_eq!(dup_vars.len(), 2);
-        assert!(dup_vars.iter().any(|v| v.key == "API_KEY" && v.value == "secret123"));
-        assert!(dup_vars.iter().any(|v| v.key == "BASE_URL" && v.value == "http://localhost"));
+        assert!(dup_vars
+            .iter()
+            .any(|v| v.key == "API_KEY" && v.value == "secret123"));
+        assert!(dup_vars
+            .iter()
+            .any(|v| v.key == "BASE_URL" && v.value == "http://localhost"));
     }
 
     #[tokio::test]
     async fn test_delete_environment_cascades_variables() {
         let (_tmp, pool) = setup().await;
 
-        let env = create_environment(&pool, "local".to_string()).await.unwrap();
-        set_env_variable(&pool, &env.id, "KEY".to_string(), "val".to_string(), false).await.unwrap();
+        let env = create_environment(&pool, "local".to_string())
+            .await
+            .unwrap();
+        set_env_variable(&pool, &env.id, "KEY".to_string(), "val".to_string(), false)
+            .await
+            .unwrap();
 
         delete_environment(&pool, &env.id).await.unwrap();
 

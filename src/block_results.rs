@@ -1,5 +1,5 @@
 use serde::Serialize;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 
@@ -162,9 +162,17 @@ mod tests {
     async fn test_save_and_get() {
         let (pool, _tmp) = setup().await;
 
-        save_block_result(&pool, "test.md", "hash1", "success", r#"{"ok":true}"#, 150, None)
-            .await
-            .unwrap();
+        save_block_result(
+            &pool,
+            "test.md",
+            "hash1",
+            "success",
+            r#"{"ok":true}"#,
+            150,
+            None,
+        )
+        .await
+        .unwrap();
 
         let result = get_block_result(&pool, "test.md", "hash1").await.unwrap();
         assert!(result.is_some());
@@ -179,12 +187,28 @@ mod tests {
     async fn test_save_upserts() {
         let (pool, _tmp) = setup().await;
 
-        save_block_result(&pool, "test.md", "hash1", "success", r#"{"v":1}"#, 100, None)
-            .await
-            .unwrap();
-        save_block_result(&pool, "test.md", "hash1", "success", r#"{"v":2}"#, 200, Some(5))
-            .await
-            .unwrap();
+        save_block_result(
+            &pool,
+            "test.md",
+            "hash1",
+            "success",
+            r#"{"v":1}"#,
+            100,
+            None,
+        )
+        .await
+        .unwrap();
+        save_block_result(
+            &pool,
+            "test.md",
+            "hash1",
+            "success",
+            r#"{"v":2}"#,
+            200,
+            Some(5),
+        )
+        .await
+        .unwrap();
 
         let r = get_block_result(&pool, "test.md", "hash1")
             .await
@@ -206,8 +230,14 @@ mod tests {
             .await
             .unwrap();
 
-        let r1 = get_block_result(&pool, "test.md", "hash1").await.unwrap().unwrap();
-        let r2 = get_block_result(&pool, "test.md", "hash2").await.unwrap().unwrap();
+        let r1 = get_block_result(&pool, "test.md", "hash1")
+            .await
+            .unwrap()
+            .unwrap();
+        let r2 = get_block_result(&pool, "test.md", "hash2")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(r1.status, "success");
         assert_eq!(r2.status, "error");
     }
@@ -226,10 +256,21 @@ mod tests {
             .await
             .unwrap();
 
-        delete_block_results_for_file(&pool, "test.md").await.unwrap();
+        delete_block_results_for_file(&pool, "test.md")
+            .await
+            .unwrap();
 
-        assert!(get_block_result(&pool, "test.md", "h1").await.unwrap().is_none());
-        assert!(get_block_result(&pool, "test.md", "h2").await.unwrap().is_none());
-        assert!(get_block_result(&pool, "other.md", "h1").await.unwrap().is_some());
+        assert!(get_block_result(&pool, "test.md", "h1")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_block_result(&pool, "test.md", "h2")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_block_result(&pool, "other.md", "h1")
+            .await
+            .unwrap()
+            .is_some());
     }
 }

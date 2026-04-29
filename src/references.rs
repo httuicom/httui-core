@@ -287,18 +287,15 @@ mod tests {
         );
 
         let mut env_vars = HashMap::new();
-        env_vars.insert("BASE_URL".to_string(), "https://api.example.com".to_string());
+        env_vars.insert(
+            "BASE_URL".to_string(),
+            "https://api.example.com".to_string(),
+        );
 
         let resolved = resolve_all(&params, &block_results, &env_vars);
 
-        assert_eq!(
-            resolved["url"],
-            "https://api.example.com/users/42"
-        );
-        assert_eq!(
-            resolved["headers"][0]["value"],
-            "Bearer jwt-abc"
-        );
+        assert_eq!(resolved["url"], "https://api.example.com/users/42");
+        assert_eq!(resolved["headers"][0]["value"], "Bearer jwt-abc");
     }
 
     #[test]

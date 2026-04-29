@@ -117,10 +117,7 @@ pub fn to_curl(params: &Value) -> String {
     let url = build_url_with_query(params);
     let body = read_body(params);
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!(
-        "curl -X {method} {}",
-        shell_single_quote(&url)
-    ));
+    lines.push(format!("curl -X {method} {}", shell_single_quote(&url)));
     for (k, v) in iter_kv(params.get("headers")) {
         lines.push(format!("  -H {}", shell_single_quote(&format!("{k}: {v}"))));
     }

@@ -65,7 +65,10 @@ impl ExecutorRegistry {
             .executors
             .get(&req.block_type)
             .ok_or_else(|| ExecutorError(format!("Unknown block type: {}", req.block_type)))?;
-        executor.validate(&req.params).await.map_err(ExecutorError)?;
+        executor
+            .validate(&req.params)
+            .await
+            .map_err(ExecutorError)?;
         executor.execute(req.params).await
     }
 }

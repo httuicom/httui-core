@@ -106,10 +106,7 @@ pub enum HttpChunk {
     /// total bytes received before this chunk (so receivers can verify
     /// continuity). V1 frontend ignores these except for a "downloading
     /// X kb…" progress counter — `Complete` carries the consolidated body.
-    BodyChunk {
-        offset: u64,
-        bytes: Vec<u8>,
-    },
+    BodyChunk { offset: u64, bytes: Vec<u8> },
     /// Terminal chunk containing the full response. Consumer should close
     /// the subscription after receiving this. The cache writes from this.
     Complete(HttpResponse),
@@ -192,7 +189,9 @@ mod tests {
 
     #[test]
     fn http_chunk_error_and_cancelled_serialize() {
-        let err = HttpChunk::Error { message: "boom".to_string() };
+        let err = HttpChunk::Error {
+            message: "boom".to_string(),
+        };
         let v = serde_json::to_value(&err).unwrap();
         assert_eq!(v["kind"], "error");
         assert_eq!(v["message"], "boom");
@@ -213,9 +212,7 @@ mod tests {
 
     #[test]
     fn parse_set_cookie_with_attrs() {
-        let c =
-            parse_set_cookie("sid=xyz; Domain=example.com; Path=/; Secure; HttpOnly")
-                .unwrap();
+        let c = parse_set_cookie("sid=xyz; Domain=example.com; Path=/; Secure; HttpOnly").unwrap();
         assert_eq!(c.name, "sid");
         assert_eq!(c.value, "xyz");
         assert_eq!(c.domain.as_deref(), Some("example.com"));
@@ -226,10 +223,7 @@ mod tests {
 
     #[test]
     fn parse_set_cookie_with_expires() {
-        let c = parse_set_cookie(
-            "foo=bar; Expires=Wed, 21 Oct 2026 07:28:00 GMT",
-        )
-        .unwrap();
+        let c = parse_set_cookie("foo=bar; Expires=Wed, 21 Oct 2026 07:28:00 GMT").unwrap();
         assert_eq!(c.expires.as_deref(), Some("Wed, 21 Oct 2026 07:28:00 GMT"));
     }
 

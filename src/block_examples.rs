@@ -110,12 +110,11 @@ pub async fn purge_examples_for_block(
     file_path: &str,
     block_alias: &str,
 ) -> Result<u64, sqlx::Error> {
-    let result =
-        sqlx::query("DELETE FROM block_examples WHERE file_path = ? AND block_alias = ?")
-            .bind(file_path)
-            .bind(block_alias)
-            .execute(pool)
-            .await?;
+    let result = sqlx::query("DELETE FROM block_examples WHERE file_path = ? AND block_alias = ?")
+        .bind(file_path)
+        .bind(block_alias)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -150,7 +149,9 @@ mod tests {
     #[tokio::test]
     async fn save_and_list() {
         let pool = setup().await;
-        let id = save_example(&pool, "/a.md", "req1", "happy", "{\"status\":200}").await.unwrap();
+        let id = save_example(&pool, "/a.md", "req1", "happy", "{\"status\":200}")
+            .await
+            .unwrap();
         assert!(id > 0);
         let rows = list_examples(&pool, "/a.md", "req1").await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -161,8 +162,12 @@ mod tests {
     #[tokio::test]
     async fn upsert_replaces_on_conflict() {
         let pool = setup().await;
-        save_example(&pool, "/a.md", "req1", "v1", "{\"status\":200}").await.unwrap();
-        save_example(&pool, "/a.md", "req1", "v1", "{\"status\":201}").await.unwrap();
+        save_example(&pool, "/a.md", "req1", "v1", "{\"status\":200}")
+            .await
+            .unwrap();
+        save_example(&pool, "/a.md", "req1", "v1", "{\"status\":201}")
+            .await
+            .unwrap();
         let rows = list_examples(&pool, "/a.md", "req1").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].response_json, "{\"status\":201}");
@@ -171,44 +176,91 @@ mod tests {
     #[tokio::test]
     async fn isolates_by_file_and_alias() {
         let pool = setup().await;
-        save_example(&pool, "/a.md", "req1", "x", "1").await.unwrap();
-        save_example(&pool, "/b.md", "req1", "x", "2").await.unwrap();
-        save_example(&pool, "/a.md", "other", "x", "3").await.unwrap();
-        assert_eq!(list_examples(&pool, "/a.md", "req1").await.unwrap().len(), 1);
-        assert_eq!(list_examples(&pool, "/b.md", "req1").await.unwrap().len(), 1);
-        assert_eq!(list_examples(&pool, "/a.md", "other").await.unwrap().len(), 1);
+        save_example(&pool, "/a.md", "req1", "x", "1")
+            .await
+            .unwrap();
+        save_example(&pool, "/b.md", "req1", "x", "2")
+            .await
+            .unwrap();
+        save_example(&pool, "/a.md", "other", "x", "3")
+            .await
+            .unwrap();
+        assert_eq!(
+            list_examples(&pool, "/a.md", "req1").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            list_examples(&pool, "/b.md", "req1").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            list_examples(&pool, "/a.md", "other").await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn delete_by_id() {
         let pool = setup().await;
-        let id = save_example(&pool, "/a.md", "req1", "x", "1").await.unwrap();
+        let id = save_example(&pool, "/a.md", "req1", "x", "1")
+            .await
+            .unwrap();
         let removed = delete_example(&pool, id).await.unwrap();
         assert_eq!(removed, 1);
-        assert!(list_examples(&pool, "/a.md", "req1").await.unwrap().is_empty());
+        assert!(list_examples(&pool, "/a.md", "req1")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn purge_for_file_drops_all_aliases() {
         let pool = setup().await;
-        save_example(&pool, "/a.md", "req1", "x", "1").await.unwrap();
-        save_example(&pool, "/a.md", "req2", "y", "2").await.unwrap();
-        save_example(&pool, "/b.md", "req1", "z", "3").await.unwrap();
+        save_example(&pool, "/a.md", "req1", "x", "1")
+            .await
+            .unwrap();
+        save_example(&pool, "/a.md", "req2", "y", "2")
+            .await
+            .unwrap();
+        save_example(&pool, "/b.md", "req1", "z", "3")
+            .await
+            .unwrap();
         let removed = purge_examples_for_file(&pool, "/a.md").await.unwrap();
         assert_eq!(removed, 2);
-        assert!(list_examples(&pool, "/a.md", "req1").await.unwrap().is_empty());
-        assert!(list_examples(&pool, "/a.md", "req2").await.unwrap().is_empty());
-        assert_eq!(list_examples(&pool, "/b.md", "req1").await.unwrap().len(), 1);
+        assert!(list_examples(&pool, "/a.md", "req1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(list_examples(&pool, "/a.md", "req2")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            list_examples(&pool, "/b.md", "req1").await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn purge_for_block_only_drops_that_alias() {
         let pool = setup().await;
-        save_example(&pool, "/a.md", "req1", "x", "1").await.unwrap();
-        save_example(&pool, "/a.md", "req2", "y", "2").await.unwrap();
-        let removed = purge_examples_for_block(&pool, "/a.md", "req1").await.unwrap();
+        save_example(&pool, "/a.md", "req1", "x", "1")
+            .await
+            .unwrap();
+        save_example(&pool, "/a.md", "req2", "y", "2")
+            .await
+            .unwrap();
+        let removed = purge_examples_for_block(&pool, "/a.md", "req1")
+            .await
+            .unwrap();
         assert_eq!(removed, 1);
-        assert!(list_examples(&pool, "/a.md", "req1").await.unwrap().is_empty());
-        assert_eq!(list_examples(&pool, "/a.md", "req2").await.unwrap().len(), 1);
+        assert!(list_examples(&pool, "/a.md", "req1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            list_examples(&pool, "/a.md", "req2").await.unwrap().len(),
+            1
+        );
     }
 }

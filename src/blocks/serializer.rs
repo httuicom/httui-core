@@ -318,14 +318,9 @@ mod tests {
 
     #[test]
     fn http_emits_request_line_with_method_and_url() {
-        let parsed = parse_blocks(
-            "```http alias=h\nGET https://example.com/users\n```\n",
-        );
+        let parsed = parse_blocks("```http alias=h\nGET https://example.com/users\n```\n");
         let out = serialize_block(&parsed[0]);
-        assert_eq!(
-            out,
-            "```http alias=h\nGET https://example.com/users\n```",
-        );
+        assert_eq!(out, "```http alias=h\nGET https://example.com/users\n```",);
     }
 
     #[test]

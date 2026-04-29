@@ -13,9 +13,7 @@ pub struct ParsedBlock {
 }
 
 /// Known executable block types.
-const EXECUTABLE_TYPES: &[&str] = &[
-    "http", "db", "db-postgres", "db-mysql", "db-sqlite",
-];
+const EXECUTABLE_TYPES: &[&str] = &["http", "db", "db-postgres", "db-mysql", "db-sqlite"];
 
 /// Parse all executable blocks from a markdown string.
 ///
@@ -128,7 +126,10 @@ fn synthesize_db_params_from_info(
     attrs: &HashMap<String, String>,
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
-    obj.insert("query".to_string(), serde_json::Value::String(body.to_string()));
+    obj.insert(
+        "query".to_string(),
+        serde_json::Value::String(body.to_string()),
+    );
 
     if let Some(conn) = attrs.get("connection") {
         if !conn.is_empty() {
@@ -140,10 +141,7 @@ fn synthesize_db_params_from_info(
     }
     if let Some(limit_str) = attrs.get("limit") {
         if let Ok(limit) = limit_str.parse::<u64>() {
-            obj.insert(
-                "limit".to_string(),
-                serde_json::Value::Number(limit.into()),
-            );
+            obj.insert("limit".to_string(), serde_json::Value::Number(limit.into()));
         }
     }
     if let Some(timeout_str) = attrs.get("timeout") {
@@ -267,10 +265,7 @@ fn parse_http_message_body(body: &str, attrs: &HashMap<String, String>) -> serde
     let body_text = body_lines.join("\n");
 
     let mut obj = serde_json::Map::new();
-    obj.insert(
-        "method".to_string(),
-        serde_json::Value::String(method),
-    );
+    obj.insert("method".to_string(), serde_json::Value::String(method));
     obj.insert("url".to_string(), serde_json::Value::String(url));
     obj.insert(
         "params".to_string(),
@@ -300,10 +295,7 @@ fn parse_http_message_body(body: &str, attrs: &HashMap<String, String>) -> serde
                 .collect(),
         ),
     );
-    obj.insert(
-        "body".to_string(),
-        serde_json::Value::String(body_text),
-    );
+    obj.insert("body".to_string(), serde_json::Value::String(body_text));
 
     if let Some(timeout_str) = attrs.get("timeout") {
         if let Ok(timeout) = timeout_str.parse::<u64>() {
@@ -404,10 +396,7 @@ fn split_header_line(line: &str) -> Option<(String, String)> {
 }
 
 /// Find a block by alias in a list of parsed blocks.
-pub fn find_block_by_alias<'a>(
-    blocks: &'a [ParsedBlock],
-    alias: &str,
-) -> Option<&'a ParsedBlock> {
+pub fn find_block_by_alias<'a>(blocks: &'a [ParsedBlock], alias: &str) -> Option<&'a ParsedBlock> {
     blocks.iter().find(|b| b.alias.as_deref() == Some(alias))
 }
 
@@ -901,7 +890,8 @@ Authorization: Bearer x
 
     #[test]
     fn test_parse_http_new_format_preserves_body_blank_lines() {
-        let md = "```http\nPOST https://example.com\nContent-Type: text/plain\n\nline1\n\nline3\n```\n";
+        let md =
+            "```http\nPOST https://example.com\nContent-Type: text/plain\n\nline1\n\nline3\n```\n";
         let blocks = parse_blocks(md);
         assert_eq!(blocks[0].params["body"], "line1\n\nline3");
     }

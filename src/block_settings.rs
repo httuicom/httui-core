@@ -115,12 +115,11 @@ pub async fn purge_settings(
     file_path: &str,
     block_alias: &str,
 ) -> Result<u64, sqlx::Error> {
-    let result =
-        sqlx::query("DELETE FROM block_settings WHERE file_path = ? AND block_alias = ?")
-            .bind(file_path)
-            .bind(block_alias)
-            .execute(pool)
-            .await?;
+    let result = sqlx::query("DELETE FROM block_settings WHERE file_path = ? AND block_alias = ?")
+        .bind(file_path)
+        .bind(block_alias)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -233,14 +232,9 @@ mod tests {
         )
         .await
         .unwrap();
-        upsert_settings(
-            &pool,
-            "/b.md",
-            "req1",
-            BlockSettings::default(),
-        )
-        .await
-        .unwrap();
+        upsert_settings(&pool, "/b.md", "req1", BlockSettings::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             get_settings(&pool, "/a.md", "req1")

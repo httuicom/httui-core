@@ -115,19 +115,22 @@ pub async fn list_history(
     file_path: &str,
     block_alias: &str,
 ) -> Result<Vec<HistoryEntry>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (
-        i64,
-        String,
-        String,
-        String,
-        String,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        String,
-        String,
-    )>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            String,
+            String,
+        ),
+    >(
         "SELECT id, file_path, block_alias, method, url_canonical, status,
                 request_size, response_size, elapsed_ms, outcome, ran_at
          FROM block_run_history
@@ -166,13 +169,12 @@ pub async fn purge_history(
     file_path: &str,
     block_alias: &str,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM block_run_history WHERE file_path = ? AND block_alias = ?",
-    )
-    .bind(file_path)
-    .bind(block_alias)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("DELETE FROM block_run_history WHERE file_path = ? AND block_alias = ?")
+            .bind(file_path)
+            .bind(block_alias)
+            .execute(pool)
+            .await?;
     Ok(result.rows_affected())
 }
 
@@ -239,8 +241,12 @@ mod tests {
     #[tokio::test]
     async fn inserts_and_lists() {
         let pool = setup().await;
-        insert_history_entry(&pool, entry("GET", 200)).await.unwrap();
-        insert_history_entry(&pool, entry("POST", 201)).await.unwrap();
+        insert_history_entry(&pool, entry("GET", 200))
+            .await
+            .unwrap();
+        insert_history_entry(&pool, entry("POST", 201))
+            .await
+            .unwrap();
         let rows = list_history(&pool, "/notes/test.md", "req1").await.unwrap();
         assert_eq!(rows.len(), 2);
         // Most recent first → POST was inserted last.
@@ -293,7 +299,9 @@ mod tests {
     async fn purge_removes_block_history() {
         let pool = setup().await;
         for _ in 0..3 {
-            insert_history_entry(&pool, entry("GET", 200)).await.unwrap();
+            insert_history_entry(&pool, entry("GET", 200))
+                .await
+                .unwrap();
         }
         let removed = purge_history(&pool, "/notes/test.md", "req1")
             .await
