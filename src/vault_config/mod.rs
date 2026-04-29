@@ -11,6 +11,7 @@
 //! built in a later epic).
 
 pub mod atomic;
+pub mod connection_traits;
 pub mod connection_views;
 pub mod connections;
 pub mod connections_store;
