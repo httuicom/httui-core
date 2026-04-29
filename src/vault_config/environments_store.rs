@@ -14,10 +14,11 @@ use std::time::SystemTime;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
-use crate::db::keychain::{delete_secret, env_var_key, resolve_secret_ref, store_secret};
+use crate::db::keychain::{delete_secret, env_var_key};
 
 use super::atomic::{read_toml, write_toml};
 use super::envs::{EnvFile, EnvMeta};
+use super::secret_resolver::{ensure_keychain_ref, resolve_value};
 use super::user::UserFile;
 use super::validate::{validate_env_file, Severity};
 use super::Version;
@@ -288,11 +289,8 @@ impl EnvironmentsStore {
             return Ok(Some(v.clone()));
         }
         if let Some(reference) = file.secrets.get(key) {
-            return match resolve_secret_ref(reference) {
-                Ok(Some(v)) => Ok(Some(v)),
-                Ok(None) => Err(format!("secret '{key}' has no keychain entry")),
-                Err(e) => Err(format!("resolving secret '{key}': {e}")),
-            };
+            return resolve_value(reference)
+                .map_err(|e| format!("resolving secret '{key}': {e}"));
         }
         Ok(None)
     }
@@ -320,9 +318,7 @@ impl EnvironmentsStore {
             // Move plaintext to keychain; write only the reference into
             // the TOML.
             let kc_key = env_var_key(&env_name, &key);
-            store_secret(&kc_key, &value)
-                .map_err(|e| format!("Failed to store secret securely: {e}"))?;
-            let reference = format!("{{{{keychain:{kc_key}}}}}");
+            let reference = ensure_keychain_ref(&kc_key, &value)?;
             // If a same-named non-secret existed, remove it.
             file.vars.remove(&key);
             file.secrets.insert(key.clone(), reference);
