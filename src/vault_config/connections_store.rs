@@ -26,11 +26,10 @@ use super::connection_views::{
 use super::connections::{
     CommonFields, Connection, ConnectionsFile, MysqlConfig, PostgresConfig, SqliteConfig,
 };
+use super::layout::CONNECTIONS_FILE;
 use super::secret_resolver::ensure_keychain_ref;
 use super::validate::validate_connections_file;
 use super::Version;
-
-const CONNECTIONS_FILE: &str = "connections.toml";
 
 // --- input DTOs -----------------------------------------------------------
 

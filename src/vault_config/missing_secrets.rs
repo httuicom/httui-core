@@ -13,6 +13,8 @@ use std::path::Path;
 use crate::secrets::parser;
 use crate::secrets::SecretBackend;
 
+use super::layout::{CONNECTIONS_FILE, ENVS_DIR};
+
 /// One missing reference. The grouping is what the UI uses to label
 /// the form sections ("3 connections need passwords", "5 env vars
 /// need values").
@@ -64,7 +66,7 @@ pub fn scan_missing_secrets<B: SecretBackend>(
 }
 
 fn collect_connections(vault_root: &Path, out: &mut Vec<MissingRef>) -> Result<(), String> {
-    let path = vault_root.join("connections.toml");
+    let path = vault_root.join(CONNECTIONS_FILE);
     if !path.exists() {
         return Ok(());
     }
@@ -83,7 +85,7 @@ fn collect_connections(vault_root: &Path, out: &mut Vec<MissingRef>) -> Result<(
             if let Some(s) = value.as_str() {
                 if let Ok(("keychain", addr)) = parser::parse_secret_ref(s) {
                     out.push(MissingRef {
-                        source_file: "connections.toml".to_string(),
+                        source_file: CONNECTIONS_FILE.to_string(),
                         label: format!("connection `{name}` / {field}"),
                         keychain_key: addr.to_string(),
                         kind: MissingKind::Connection,
@@ -96,7 +98,7 @@ fn collect_connections(vault_root: &Path, out: &mut Vec<MissingRef>) -> Result<(
 }
 
 fn collect_envs(vault_root: &Path, out: &mut Vec<MissingRef>) -> Result<(), String> {
-    let dir = vault_root.join("envs");
+    let dir = vault_root.join(ENVS_DIR);
     if !dir.is_dir() {
         return Ok(());
     }

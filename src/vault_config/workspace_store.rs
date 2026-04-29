@@ -18,12 +18,10 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 
 use super::atomic::{read_toml, write_toml};
+use super::layout::{WORKSPACE_DIR, WORKSPACE_FILE};
 use super::merge::{load_with_local, mtime_or_none};
 use super::workspace::{WorkspaceDefaults, WorkspaceFile};
 use super::Version;
-
-const WORKSPACE_DIR: &str = ".httui";
-const WORKSPACE_FILE: &str = "workspace.toml";
 
 /// Cache entry. Keys on both base and override mtimes so a touch on
 /// either side invalidates correctly (ADR 0004 cache rule).

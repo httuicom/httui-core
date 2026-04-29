@@ -18,6 +18,7 @@ pub mod connections_store;
 pub mod environments_store;
 pub mod envs;
 pub mod gitignore;
+pub mod layout;
 pub mod merge;
 pub mod migration;
 pub mod missing_secrets;

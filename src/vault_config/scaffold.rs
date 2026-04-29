@@ -18,6 +18,7 @@ use std::path::Path;
 
 use super::atomic::write_atomic;
 use super::gitignore::ensure_local_overrides_in_gitignore;
+use super::layout::{CONNECTIONS_FILE, ENVS_DIR, WORKSPACE_DIR, WORKSPACE_FILE};
 
 /// Heuristic: is this folder a httui vault? A folder counts as a
 /// vault when **any** of these signals are present:
@@ -33,16 +34,16 @@ pub fn is_vault(path: &Path) -> bool {
     if !path.is_dir() {
         return false;
     }
-    if path.join(".httui").is_dir() {
+    if path.join(WORKSPACE_DIR).is_dir() {
         return true;
     }
     if path.join("runbooks").is_dir() {
         return true;
     }
-    if path.join("connections.toml").is_file() {
+    if path.join(CONNECTIONS_FILE).is_file() {
         return true;
     }
-    if path.join("envs").is_dir() {
+    if path.join(ENVS_DIR).is_dir() {
         return true;
     }
     // Top-level markdown counts.
@@ -85,27 +86,29 @@ pub struct ScaffoldReport {
 pub fn scaffold_new_vault(path: &Path) -> std::io::Result<ScaffoldReport> {
     std::fs::create_dir_all(path)?;
     std::fs::create_dir_all(path.join("runbooks"))?;
-    std::fs::create_dir_all(path.join("envs"))?;
-    std::fs::create_dir_all(path.join(".httui"))?;
+    std::fs::create_dir_all(path.join(ENVS_DIR))?;
+    std::fs::create_dir_all(path.join(WORKSPACE_DIR))?;
 
     let mut created = Vec::new();
 
-    let connections = path.join("connections.toml");
+    let connections = path.join(CONNECTIONS_FILE);
     if !connections.exists() {
         write_atomic(&connections, DEFAULT_CONNECTIONS_TOML)?;
-        created.push("connections.toml".to_string());
+        created.push(CONNECTIONS_FILE.to_string());
     }
 
-    let env_local = path.join("envs/local.toml");
+    let env_local_rel = format!("{ENVS_DIR}/local.toml");
+    let env_local = path.join(&env_local_rel);
     if !env_local.exists() {
         write_atomic(&env_local, DEFAULT_LOCAL_ENV_TOML)?;
-        created.push("envs/local.toml".to_string());
+        created.push(env_local_rel);
     }
 
-    let workspace = path.join(".httui/workspace.toml");
+    let workspace_rel = format!("{WORKSPACE_DIR}/{WORKSPACE_FILE}");
+    let workspace = path.join(&workspace_rel);
     if !workspace.exists() {
         write_atomic(&workspace, DEFAULT_WORKSPACE_TOML)?;
-        created.push(".httui/workspace.toml".to_string());
+        created.push(workspace_rel);
     }
 
     // Gitignore: only mark as `created` when we actually wrote.

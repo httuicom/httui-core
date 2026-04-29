@@ -18,12 +18,11 @@ use crate::db::keychain::{delete_secret, env_var_key};
 
 use super::atomic::{read_toml, write_toml};
 use super::envs::{EnvFile, EnvMeta};
+use super::layout::ENVS_DIR;
 use super::secret_resolver::{ensure_keychain_ref, resolve_value};
 use super::user::UserFile;
 use super::validate::{validate_env_file, Severity};
 use super::Version;
-
-const ENVS_DIR: &str = "envs";
 
 // --- DTOs --------------------------------------------------------------------
 
