@@ -3,6 +3,7 @@ pub mod connections;
 pub mod environments;
 pub mod keychain;
 pub mod lookup;
+pub mod pool_manager;
 pub mod schema_cache;
 
 use serde::Serialize;
