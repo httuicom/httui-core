@@ -20,6 +20,7 @@ pub mod merge;
 pub mod user;
 pub mod user_store;
 pub mod validate;
+pub mod watch_paths;
 pub mod workspace;
 pub mod workspace_store;
 
