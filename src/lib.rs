@@ -8,6 +8,7 @@ pub mod db;
 pub mod error;
 pub mod executor;
 pub mod fs;
+pub mod git;
 pub mod paths;
 pub mod references;
 pub mod runner;
