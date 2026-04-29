@@ -26,6 +26,7 @@ pub struct ConnectionsFile {
 pub enum Connection {
     Postgres(PostgresConfig),
     Mysql(MysqlConfig),
+    Sqlite(SqliteConfig),
     Mongo(MongoConfig),
     Http(HttpConfig),
     Ws(WsConfig),
@@ -64,6 +65,15 @@ pub struct MysqlConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    #[serde(flatten)]
+    pub common: CommonFields,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteConfig {
+    /// Filesystem path to the SQLite database. Supports `~` expansion
+    /// at the resolver layer; raw value is stored verbatim.
+    pub path: String,
     #[serde(flatten)]
     pub common: CommonFields,
 }
@@ -185,7 +195,22 @@ timeout_ms = 30000
     }
 
     #[test]
-    fn parses_all_nine_variants() {
+    fn parses_sqlite() {
+        let raw = r#"
+version = "1"
+[connections.local-cache]
+type = "sqlite"
+path = "/Users/me/cache.db"
+"#;
+        let f: ConnectionsFile = toml::from_str(raw).expect("parse");
+        match f.connections.get("local-cache").unwrap() {
+            Connection::Sqlite(s) => assert_eq!(s.path, "/Users/me/cache.db"),
+            _ => panic!("expected sqlite variant"),
+        }
+    }
+
+    #[test]
+    fn parses_all_ten_variants() {
         let raw = r#"
 version = "1"
 
@@ -204,6 +229,10 @@ port = 3306
 database = "d"
 user = "u"
 password = "p"
+
+[connections.sq]
+type = "sqlite"
+path = "/tmp/db.sqlite"
 
 [connections.mo]
 type = "mongo"
@@ -235,7 +264,7 @@ type = "shell"
 shell = "bash"
 "#;
         let f: ConnectionsFile = toml::from_str(raw).expect("parse");
-        assert_eq!(f.connections.len(), 9);
+        assert_eq!(f.connections.len(), 10);
     }
 
     #[test]

@@ -293,11 +293,13 @@ pub fn validate_connections_file(file: &ConnectionsFile) -> Report {
                     &c.credentials_path,
                 );
             }
-            Connection::Ws(_)
+            Connection::Sqlite(_)
+            | Connection::Ws(_)
             | Connection::Grpc(_)
             | Connection::Graphql(_)
             | Connection::Shell(_) => {
-                // No fields here are conventionally sensitive on their own.
+                // SQLite is a path-only driver; the others have no
+                // conventionally-sensitive fields on their own.
                 // Header-bearing types (graphql) could grow checks later.
             }
         }
