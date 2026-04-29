@@ -12,6 +12,7 @@ pub mod paths;
 pub mod references;
 pub mod runner;
 pub mod search;
+pub mod vault_config;
 pub mod vaults;
 
 pub use error::{CoreError, CoreResult};
