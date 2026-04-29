@@ -38,3 +38,36 @@ pub enum Version {
     #[serde(rename = "1")]
     V1,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_default_is_v1() {
+        assert_eq!(Version::default(), Version::V1);
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct VersionedDoc {
+        version: Version,
+    }
+
+    #[test]
+    fn version_serializes_as_string_one() {
+        // Whole-vault TOML files stamp `version = "1"`. Bumping the enum
+        // discriminator without updating the rename would silently break
+        // every existing vault, so this test pins the wire format.
+        let toml_str = toml::to_string(&VersionedDoc {
+            version: Version::V1,
+        })
+        .unwrap();
+        assert!(toml_str.contains("version = \"1\""), "got: {toml_str}");
+    }
+
+    #[test]
+    fn version_round_trips_through_toml() {
+        let doc: VersionedDoc = toml::from_str("version = \"1\"").unwrap();
+        assert_eq!(doc.version, Version::V1);
+    }
+}

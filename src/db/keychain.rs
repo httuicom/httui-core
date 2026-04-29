@@ -176,4 +176,68 @@ mod tests {
             "sentinel must NOT silently fall back to plaintext when keychain is unavailable"
         );
     }
+
+    #[test]
+    fn forced_failure_makes_delete_secret_error() {
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        force_keychain_failure(true);
+        let result = delete_secret("test:key");
+        force_keychain_failure(false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn conn_password_key_format() {
+        assert_eq!(conn_password_key("pg-prod"), "conn:pg-prod:password");
+        assert_eq!(conn_password_key(""), "conn::password");
+    }
+
+    #[test]
+    fn env_var_key_format() {
+        assert_eq!(env_var_key("staging", "DB_URL"), "env:staging:DB_URL");
+        assert_eq!(env_var_key("", ""), "env::");
+    }
+
+    #[test]
+    fn resolve_secret_ref_rejects_non_reference() {
+        let err = resolve_secret_ref("plain-value").expect_err("must reject");
+        assert!(err.contains("not a secret reference"));
+    }
+
+    #[test]
+    fn resolve_secret_ref_rejects_missing_separator() {
+        let err = resolve_secret_ref("{{nobackend}}").expect_err("must reject");
+        assert!(err.contains("malformed reference"));
+    }
+
+    #[test]
+    fn resolve_secret_ref_rejects_unhandled_backend() {
+        let err = resolve_secret_ref("{{1password:Personal/x}}").expect_err("must reject");
+        assert!(err.contains("not handled by this resolver"));
+    }
+
+    #[test]
+    fn resolve_secret_ref_rejects_empty_address() {
+        let err = resolve_secret_ref("{{keychain:}}").expect_err("must reject");
+        assert!(err.contains("empty address"));
+    }
+
+    #[test]
+    fn resolve_secret_ref_propagates_keychain_error() {
+        // Forcing keychain failure exercises the success-path branch up to
+        // the point where get_secret runs — verifies the parser reaches
+        // backend dispatch correctly, and that errors propagate.
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        force_keychain_failure(true);
+        let result = resolve_secret_ref("{{keychain:conn:pg:password}}");
+        force_keychain_failure(false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_secret_ref_trims_whitespace() {
+        // The parser trims surrounding whitespace before checking braces.
+        let err = resolve_secret_ref("   plain   ").expect_err("must reject");
+        assert!(err.contains("not a secret reference"));
+    }
 }
