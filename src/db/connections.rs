@@ -13,7 +13,7 @@ pub use super::pool_manager::{PoolManager, StatusEmitter};
 // validators, sanitizer) moved to `db::pool` (Epic 20a Story 01 —
 // fourth split). Re-exported here so existing imports compile.
 pub use super::pool::DatabasePool;
-use super::pool::{is_subqueryable_select, validate_sqlite_path};
+use super::pool::validate_sqlite_path;
 #[cfg(test)]
 use super::pool::validate_bind_values;
 

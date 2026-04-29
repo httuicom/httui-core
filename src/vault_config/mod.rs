@@ -20,6 +20,7 @@ pub mod merge;
 pub mod migration;
 pub mod missing_secrets;
 pub mod scaffold;
+pub mod secret_resolver;
 pub mod user;
 pub mod user_store;
 pub mod validate;
