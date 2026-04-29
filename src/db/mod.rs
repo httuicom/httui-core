@@ -283,4 +283,97 @@ mod tests {
         let pool2 = init_db(tmp.path()).await.unwrap();
         pool2.close().await;
     }
+
+    async fn memory_pool() -> SqlitePool {
+        SqlitePool::connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn query_internal_db_rejects_non_select() {
+        let pool = memory_pool().await;
+        for sql in [
+            "DELETE FROM x",
+            "UPDATE x SET y = 1",
+            "INSERT INTO x VALUES (1)",
+            "DROP TABLE x",
+            "PRAGMA journal_mode = WAL", // PRAGMA with `=` writes
+        ] {
+            let err = query_internal_db(&pool, sql, 0, 10).await.unwrap_err();
+            assert!(err.contains("Only SELECT"), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn query_internal_db_rejects_multi_statement() {
+        let pool = memory_pool().await;
+        let err = query_internal_db(&pool, "SELECT 1; SELECT 2", 0, 10)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Multi-statement"));
+    }
+
+    #[tokio::test]
+    async fn query_internal_db_accepts_select_with_in_memory_pool() {
+        let pool = memory_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t (name) VALUES ('a'), ('b'), ('c')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = query_internal_db(&pool, "SELECT * FROM t", 0, 2)
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.has_more, "third row should be flagged via has_more");
+        assert_eq!(result.columns.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_internal_db_clamps_fetch_size_and_offset() {
+        let pool = memory_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // fetch_size = 0 should clamp to 1, offset = u32::MAX clamps too.
+        let result = query_internal_db(&pool, "SELECT * FROM t", u32::MAX, 0)
+            .await
+            .unwrap();
+        // Empty table — just verify no panic on clamp.
+        assert!(result.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_internal_db_accepts_with_query() {
+        // `WITH` (CTE) is in the read-allowlist alongside SELECT.
+        let pool = memory_pool().await;
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t (id) VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let result =
+            query_internal_db(&pool, "WITH cte AS (SELECT * FROM t) SELECT * FROM cte", 0, 10)
+                .await
+                .unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_internal_db_surfaces_sql_errors() {
+        let pool = memory_pool().await;
+        // Querying a table that doesn't exist — sanitize_query_error
+        // converts the sqlx error to a user-facing string.
+        let err = query_internal_db(&pool, "SELECT * FROM nonexistent", 0, 10)
+            .await
+            .unwrap_err();
+        assert!(err.to_lowercase().contains("query") || err.to_lowercase().contains("table"));
+    }
 }
