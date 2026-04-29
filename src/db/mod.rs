@@ -4,6 +4,7 @@ pub mod environments;
 pub mod keychain;
 pub mod lookup;
 pub mod pool;
+pub mod pool_exec_mysql;
 pub mod pool_exec_pg;
 pub mod pool_exec_sqlite;
 pub mod pool_manager;
