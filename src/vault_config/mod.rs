@@ -18,6 +18,7 @@ pub mod envs;
 pub mod gitignore;
 pub mod merge;
 pub mod migration;
+pub mod missing_secrets;
 pub mod scaffold;
 pub mod user;
 pub mod user_store;
