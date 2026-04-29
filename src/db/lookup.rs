@@ -62,7 +62,6 @@ impl ConnectionLookup for SqliteLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::TempDir;
 
     async fn empty_pool() -> SqlitePool {
