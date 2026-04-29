@@ -1,12 +1,3 @@
-// size:exclude file — Pending split, scheduled for Epic 20a sweep.
-// See docs-llm/v1/tech-debt.md "Storage" section. Current shape mixes
-// orchestration + DTO + builder + legacy adapter; the sweep extracts
-// each into its own sibling module.
-// coverage:exclude file — Same scope as the size opt-out. The split in
-// Epic 20a re-tests every extracted module to ≥80% individually, which
-// is the right granularity. Forcing 80% on the current monolith would
-// add tests that get deleted next refactor.
-
 //! File-backed connections store.
 //!
 //! Source of truth is `<vault_root>/connections.toml`. This module owns
@@ -22,17 +13,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use serde::Serialize;
 use tokio::sync::RwLock;
 
 use crate::db::connections::Connection as LegacyConnection;
-use crate::db::keychain::{delete_secret, KEYCHAIN_SENTINEL};
+use crate::db::keychain::delete_secret;
 
 use super::atomic::{read_toml, write_toml};
+use super::connection_views::{
+    carry_password_ref, database_name_of, description_of, driver_string_for, existing_readonly,
+    host_of, port_of, ssl_mode_of, to_legacy, to_public, username_of, ConnectionPublic,
+};
 use super::connections::{
     CommonFields, Connection, ConnectionsFile, MysqlConfig, PostgresConfig, SqliteConfig,
 };
-use super::secret_resolver::{ensure_keychain_ref, keychain_entry_exists, resolve_value};
+use super::secret_resolver::ensure_keychain_ref;
 use super::validate::validate_connections_file;
 use super::Version;
 
@@ -67,20 +61,6 @@ pub struct UpdateConnectionInput {
     pub password: Option<String>,
     pub ssl_mode: Option<String>,
     pub is_readonly: Option<bool>,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ConnectionPublic {
-    pub name: String,
-    pub driver: String,
-    pub host: Option<String>,
-    pub port: Option<u16>,
-    pub database_name: Option<String>,
-    pub username: Option<String>,
-    pub has_password: bool,
-    pub ssl_mode: Option<String>,
-    pub is_readonly: bool,
     pub description: Option<String>,
 }
 
@@ -324,96 +304,7 @@ impl ConnectionsStore {
     }
 }
 
-// --- conversion helpers ---------------------------------------------------
-
-fn driver_string_for(c: &Connection) -> &'static str {
-    match c {
-        Connection::Postgres(_) => "postgres",
-        Connection::Mysql(_) => "mysql",
-        Connection::Sqlite(_) => "sqlite",
-        Connection::Mongo(_) => "mongo",
-        Connection::Http(_) => "http",
-        Connection::Ws(_) => "ws",
-        Connection::Grpc(_) => "grpc",
-        Connection::Graphql(_) => "graphql",
-        Connection::Bigquery(_) => "bigquery",
-        Connection::Shell(_) => "shell",
-    }
-}
-
-fn host_of(c: &Connection) -> Option<String> {
-    match c {
-        Connection::Postgres(p) => Some(p.host.clone()),
-        Connection::Mysql(m) => Some(m.host.clone()),
-        _ => None,
-    }
-}
-
-fn port_of(c: &Connection) -> Option<u16> {
-    match c {
-        Connection::Postgres(p) => Some(p.port),
-        Connection::Mysql(m) => Some(m.port),
-        _ => None,
-    }
-}
-
-fn database_name_of(c: &Connection) -> Option<String> {
-    match c {
-        Connection::Postgres(p) => Some(p.database.clone()),
-        Connection::Mysql(m) => Some(m.database.clone()),
-        Connection::Sqlite(s) => Some(s.path.clone()),
-        _ => None,
-    }
-}
-
-fn username_of(c: &Connection) -> Option<String> {
-    match c {
-        Connection::Postgres(p) => Some(p.user.clone()),
-        Connection::Mysql(m) => Some(m.user.clone()),
-        _ => None,
-    }
-}
-
-fn ssl_mode_of(c: &Connection) -> Option<String> {
-    match c {
-        Connection::Postgres(p) => p.ssl_mode.clone(),
-        _ => None,
-    }
-}
-
-fn existing_readonly(c: &Connection) -> bool {
-    common_of(c).read_only
-}
-
-fn description_of(c: &Connection) -> Option<String> {
-    common_of(c).description.clone()
-}
-
-fn common_of(c: &Connection) -> &CommonFields {
-    match c {
-        Connection::Postgres(p) => &p.common,
-        Connection::Mysql(m) => &m.common,
-        Connection::Sqlite(s) => &s.common,
-        Connection::Mongo(m) => &m.common,
-        Connection::Http(h) => &h.common,
-        Connection::Ws(w) => &w.common,
-        Connection::Grpc(g) => &g.common,
-        Connection::Graphql(g) => &g.common,
-        Connection::Bigquery(b) => &b.common,
-        Connection::Shell(s) => &s.common,
-    }
-}
-
-fn carry_password_ref(c: &Connection) -> Option<String> {
-    // For variants that carry a password, an "unchanged" update keeps
-    // the existing reference verbatim — `build_connection_from_input`
-    // re-saves it back into the variant.
-    match c {
-        Connection::Postgres(p) => Some(p.password.clone()),
-        Connection::Mysql(m) => Some(m.password.clone()),
-        _ => None,
-    }
-}
+// --- input → Connection construction --------------------------------------
 
 /// Build a `Connection` from input. If `password` is provided AND it
 /// isn't already a `{{...}}` reference, it gets stored in the keychain
@@ -518,89 +409,6 @@ fn reject_unimplemented(driver: &str) -> String {
         "creating/updating `{driver}` connections from the app UI is not supported yet; \
          hand-edit connections.toml if you need this variant"
     )
-}
-
-fn to_public(name: &str, c: &Connection) -> ConnectionPublic {
-    let driver = driver_string_for(c).to_string();
-    let host = host_of(c);
-    let port = port_of(c);
-    let database_name = database_name_of(c);
-    let username = username_of(c);
-    let ssl_mode = ssl_mode_of(c);
-    let common = common_of(c);
-    let has_password = password_present(c);
-
-    ConnectionPublic {
-        name: name.to_string(),
-        driver,
-        host,
-        port,
-        database_name,
-        username,
-        has_password,
-        ssl_mode,
-        is_readonly: common.read_only,
-        description: common.description.clone(),
-    }
-}
-
-fn password_present(c: &Connection) -> bool {
-    let password = match c {
-        Connection::Postgres(p) => &p.password,
-        Connection::Mysql(m) => &m.password,
-        _ => return false,
-    };
-    if password.is_empty() {
-        return false;
-    }
-    if super::validate::is_secret_ref(password) {
-        // A reference counts as "has password" only when the keychain
-        // actually has the entry. Best-effort lookup; a transient
-        // keychain failure surfaces as has_password = false (caller
-        // can then re-prompt).
-        keychain_entry_exists(password)
-    } else {
-        // Legacy plaintext value (pre-migration) or sentinel.
-        password != KEYCHAIN_SENTINEL
-    }
-}
-
-/// Convert a vault-config Connection to the legacy struct understood by
-/// the pool manager. Resolves password references via the keychain.
-fn to_legacy(name: &str, c: &Connection) -> Result<LegacyConnection, String> {
-    let driver = driver_string_for(c).to_string();
-    let host = host_of(c);
-    let port = port_of(c).map(|p| p as i64);
-    let database_name = database_name_of(c);
-    let username = username_of(c);
-    let ssl_mode = ssl_mode_of(c);
-    let is_readonly = common_of(c).read_only;
-
-    let password = match c {
-        Connection::Postgres(p) => resolve_value(&p.password)?,
-        Connection::Mysql(m) => resolve_value(&m.password)?,
-        _ => None,
-    };
-
-    Ok(LegacyConnection {
-        id: name.to_string(),
-        name: name.to_string(),
-        driver,
-        host,
-        port,
-        database_name,
-        username,
-        password,
-        ssl_mode,
-        timeout_ms: 10000,
-        query_timeout_ms: 30000,
-        ttl_seconds: 300,
-        max_pool_size: 5,
-        is_readonly,
-        last_tested_at: None,
-        created_at: String::new(),
-        updated_at: String::new(),
-    })
 }
 
 #[cfg(test)]

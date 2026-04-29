@@ -11,6 +11,7 @@
 //! built in a later epic).
 
 pub mod atomic;
+pub mod connection_views;
 pub mod connections;
 pub mod connections_store;
 pub mod environments_store;
@@ -28,10 +29,9 @@ pub mod watch_paths;
 pub mod workspace;
 pub mod workspace_store;
 
+pub use connection_views::ConnectionPublic;
 pub use connections::{Connection, ConnectionsFile};
-pub use connections_store::{
-    ConnectionPublic, ConnectionsStore, CreateConnectionInput, UpdateConnectionInput,
-};
+pub use connections_store::{ConnectionsStore, CreateConnectionInput, UpdateConnectionInput};
 pub use environments_store::{
     EnvVariablePublic, EnvironmentPublic, EnvironmentsStore, SetVarInput,
 };
