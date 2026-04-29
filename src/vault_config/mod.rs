@@ -16,8 +16,10 @@ pub mod connections_store;
 pub mod environments_store;
 pub mod envs;
 pub mod user;
+pub mod user_store;
 pub mod validate;
 pub mod workspace;
+pub mod workspace_store;
 
 pub use connections::{Connection, ConnectionsFile};
 pub use connections_store::{
@@ -28,7 +30,9 @@ pub use environments_store::{
 };
 pub use envs::{EnvFile, EnvMeta};
 pub use user::UserFile;
-pub use workspace::WorkspaceFile;
+pub use user_store::UserStore;
+pub use workspace::{WorkspaceDefaults, WorkspaceFile};
+pub use workspace_store::WorkspaceStore;
 
 use serde::{Deserialize, Serialize};
 
