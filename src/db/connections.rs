@@ -733,7 +733,7 @@ pub async fn create_connection(
     )?;
 
     let id = Uuid::new_v4().to_string();
-    let ssl_mode = input.ssl_mode.unwrap_or_else(|| "prefer".to_string());
+    let ssl_mode = input.ssl_mode.unwrap_or_else(|| "disable".to_string());
     let timeout_ms = input.timeout_ms.unwrap_or(10000);
     let query_timeout_ms = input.query_timeout_ms.unwrap_or(30000);
     let ttl_seconds = input.ttl_seconds.unwrap_or(300);
@@ -819,7 +819,7 @@ pub async fn update_connection(
     let ssl_mode = Some(
         input
             .ssl_mode
-            .unwrap_or_else(|| existing.ssl_mode.unwrap_or_else(|| "prefer".to_string())),
+            .unwrap_or_else(|| existing.ssl_mode.unwrap_or_else(|| "disable".to_string())),
     );
     let timeout_ms = input.timeout_ms.unwrap_or(existing.timeout_ms);
     let query_timeout_ms = input.query_timeout_ms.unwrap_or(existing.query_timeout_ms);
