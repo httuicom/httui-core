@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use sqlx::sqlite::SqlitePool;
 use tokio::sync::RwLock;
 
-use super::connections::{create_pool, DatabasePool};
 use super::lookup::ConnectionLookup;
+use super::pool::{create_pool, DatabasePool};
 
 /// Trait for emitting connection status events.
 /// The Tauri app provides an AppHandle-based implementation; the MCP
