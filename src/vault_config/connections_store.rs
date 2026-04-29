@@ -1,3 +1,8 @@
+// size:exclude file — Pending split, scheduled for Epic 20a sweep.
+// See docs-llm/v1/tech-debt.md "Storage" section. Current shape mixes
+// orchestration + DTO + builder + legacy adapter; the sweep extracts
+// each into its own sibling module.
+
 //! File-backed connections store.
 //!
 //! Source of truth is `<vault_root>/connections.toml`. This module owns
