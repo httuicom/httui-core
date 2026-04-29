@@ -1,10 +1,33 @@
-// coverage:exclude file — DB pool/exec/lookup or vault-store registry. Coverage requires live DB integration tests; owned by Epic 32 (critical-path tests). Audit-027.
-
 use serde::Serialize;
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 
 use super::connections::{DatabasePool, PoolManager};
+
+// --- SQL queries (constants so tests can assert their shape) ---------------
+
+/// Postgres / Aurora-Postgres / Redshift compatible introspection.
+/// Walks `information_schema.columns` and excludes catalog schemas
+/// so regular users don't drown in 2k+ entries.
+pub const POSTGRES_INTROSPECT_SQL: &str = r#"SELECT table_schema, table_name, column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+          AND table_schema NOT LIKE 'pg_%'
+        ORDER BY table_schema, table_name, ordinal_position"#;
+
+/// MySQL / MariaDB introspection scoped to the current database. The
+/// `DATABASE()` resolution lives in the connection's `after_connect`
+/// hook — see `connections.rs` build paths.
+pub const MYSQL_INTROSPECT_SQL: &str = r#"SELECT table_schema, table_name, column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+        ORDER BY table_name, ordinal_position"#;
+
+/// SQLite introspection: tables + views (excluding sqlite_-prefixed
+/// internals) followed by `PRAGMA table_info(...)` per object.
+pub const SQLITE_OBJECTS_SQL: &str =
+    "SELECT name FROM sqlite_master \
+     WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SchemaEntry {
@@ -108,13 +131,10 @@ async fn save_to_cache(
 
 async fn introspect_sqlite(pool: &sqlx::SqlitePool) -> Result<Vec<SchemaEntry>, String> {
     // Include tables AND views. Exclude sqlite-internal objects.
-    let objects = sqlx::query(
-        "SELECT name FROM sqlite_master \
-         WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let objects = sqlx::query(SQLITE_OBJECTS_SQL)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut entries = Vec::new();
 
@@ -139,71 +159,107 @@ async fn introspect_sqlite(pool: &sqlx::SqlitePool) -> Result<Vec<SchemaEntry>, 
     Ok(entries)
 }
 
+/// Build a [`SchemaEntry`] from the four values
+/// [`POSTGRES_INTROSPECT_SQL`] returns. Pure: takes the column
+/// triples and returns an entry. Allows the SQL→struct mapping to
+/// be unit-tested without a live Postgres pool — the async wrapper
+/// just runs the query and threads each row through this helper.
+pub fn build_pg_entry(
+    schema_name: Option<String>,
+    table_name: String,
+    column_name: String,
+    data_type: Option<String>,
+) -> SchemaEntry {
+    SchemaEntry {
+        schema_name,
+        table_name,
+        column_name,
+        data_type,
+    }
+}
+
 async fn introspect_postgres(pool: &sqlx::PgPool) -> Result<Vec<SchemaEntry>, String> {
-    // `information_schema.columns` already spans tables, views, and materialized
-    // views. Exclude catalog schemas so regular users don't drown in 2k+ entries.
-    let rows = sqlx::query(
-        r#"SELECT table_schema, table_name, column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-          AND table_schema NOT LIKE 'pg_%'
-        ORDER BY table_schema, table_name, ordinal_position"#,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let rows = sqlx::query(POSTGRES_INTROSPECT_SQL)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(rows
         .iter()
-        .map(|row| SchemaEntry {
-            schema_name: row.try_get::<String, _>("table_schema").ok(),
-            table_name: row.get("table_name"),
-            column_name: row.get("column_name"),
-            data_type: row.try_get("data_type").ok(),
+        .map(|row| {
+            build_pg_entry(
+                row.try_get::<String, _>("table_schema").ok(),
+                row.get("table_name"),
+                row.get("column_name"),
+                row.try_get("data_type").ok(),
+            )
         })
         .collect())
 }
 
-/// Decode a MySQL column as UTF-8 String, tolerating VARBINARY/BLOB columns.
-/// Some MySQL proxies (notably ProxySQL) return information_schema text columns
-/// as VARBINARY, which fails String decoding. Fall back to raw bytes.
-fn mysql_str(row: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
-    if let Ok(s) = row.try_get::<String, _>(col) {
+/// Pure decoder for MySQL "either UTF-8 String or raw bytes" columns.
+/// Some MySQL proxies (notably ProxySQL) return information_schema
+/// text columns as VARBINARY, which fails `String` decoding. Falls
+/// back to raw bytes lossily decoded as UTF-8 — keeps schema entries
+/// readable even on weird proxies.
+///
+/// Caller passes the two `Result`s from
+/// `row.try_get::<String, _>(col)` and `row.try_get::<Vec<u8>, _>(col)`
+/// so this helper stays driver-agnostic and unit-testable.
+pub fn first_string_or_bytes_lossy(
+    str_attempt: Result<String, sqlx::Error>,
+    bytes_attempt: Result<Vec<u8>, sqlx::Error>,
+) -> Option<String> {
+    if let Ok(s) = str_attempt {
         return Some(s);
     }
-    if let Ok(b) = row.try_get::<Vec<u8>, _>(col) {
+    if let Ok(b) = bytes_attempt {
         return Some(String::from_utf8_lossy(&b).into_owned());
     }
     None
 }
 
-async fn introspect_mysql(pool: &sqlx::MySqlPool) -> Result<Vec<SchemaEntry>, String> {
-    // DATABASE() resolves via the USE issued in after_connect (see
-    // connections.rs build). information_schema.columns already includes
-    // columns for views; no extra join needed.
-    let rows = sqlx::query(
-        r#"SELECT table_schema, table_name, column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema = DATABASE()
-        ORDER BY table_name, ordinal_position"#,
+fn mysql_str(row: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
+    first_string_or_bytes_lossy(
+        row.try_get::<String, _>(col),
+        row.try_get::<Vec<u8>, _>(col),
     )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+}
+
+/// Build a [`SchemaEntry`] from the four values [`MYSQL_INTROSPECT_SQL`]
+/// returns, after mysql_str decoding. Returns `None` when either
+/// `table_name` or `column_name` is missing — those are the keys that
+/// uniquely identify a column, so a row missing them is unusable.
+/// Pure helper unit-tested without a live MySQL pool.
+pub fn build_mysql_entry(
+    schema_name: Option<String>,
+    table_name: Option<String>,
+    column_name: Option<String>,
+    data_type: Option<String>,
+) -> Option<SchemaEntry> {
+    Some(SchemaEntry {
+        schema_name,
+        table_name: table_name?,
+        column_name: column_name?,
+        data_type,
+    })
+}
+
+async fn introspect_mysql(pool: &sqlx::MySqlPool) -> Result<Vec<SchemaEntry>, String> {
+    let rows = sqlx::query(MYSQL_INTROSPECT_SQL)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(rows
         .iter()
         .filter_map(|row| {
-            let table_name = mysql_str(row, "TABLE_NAME")?;
-            let column_name = mysql_str(row, "COLUMN_NAME")?;
-            let data_type = mysql_str(row, "DATA_TYPE");
-            let schema_name = mysql_str(row, "TABLE_SCHEMA");
-            Some(SchemaEntry {
-                schema_name,
-                table_name,
-                column_name,
-                data_type,
-            })
+            build_mysql_entry(
+                mysql_str(row, "TABLE_SCHEMA"),
+                mysql_str(row, "TABLE_NAME"),
+                mysql_str(row, "COLUMN_NAME"),
+                mysql_str(row, "DATA_TYPE"),
+            )
         })
         .collect())
 }
@@ -355,6 +411,125 @@ mod tests {
         assert!(cached
             .iter()
             .any(|e| e.table_name == "items" && e.column_name == "val"));
+    }
+
+    // --- Pure helper tests ----------------------------------------------
+
+    #[test]
+    fn build_pg_entry_passes_values_through() {
+        let e = build_pg_entry(
+            Some("public".into()),
+            "users".into(),
+            "id".into(),
+            Some("integer".into()),
+        );
+        assert_eq!(e.schema_name.as_deref(), Some("public"));
+        assert_eq!(e.table_name, "users");
+        assert_eq!(e.column_name, "id");
+        assert_eq!(e.data_type.as_deref(), Some("integer"));
+    }
+
+    #[test]
+    fn build_pg_entry_handles_none_schema_and_type() {
+        let e = build_pg_entry(None, "t".into(), "c".into(), None);
+        assert!(e.schema_name.is_none());
+        assert!(e.data_type.is_none());
+    }
+
+    #[test]
+    fn first_string_or_bytes_lossy_prefers_string_when_present() {
+        let s: Result<String, sqlx::Error> = Ok("hello".into());
+        let b: Result<Vec<u8>, sqlx::Error> = Ok(b"world".to_vec());
+        // Even though both succeed, the String path wins.
+        assert_eq!(first_string_or_bytes_lossy(s, b).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn first_string_or_bytes_lossy_falls_back_to_bytes_decoded_lossily() {
+        let s: Result<String, sqlx::Error> =
+            Err(sqlx::Error::ColumnNotFound("x".into()));
+        let b: Result<Vec<u8>, sqlx::Error> = Ok(b"bytes".to_vec());
+        assert_eq!(first_string_or_bytes_lossy(s, b).as_deref(), Some("bytes"));
+    }
+
+    #[test]
+    fn first_string_or_bytes_lossy_returns_none_when_both_fail() {
+        let s: Result<String, sqlx::Error> =
+            Err(sqlx::Error::ColumnNotFound("x".into()));
+        let b: Result<Vec<u8>, sqlx::Error> =
+            Err(sqlx::Error::ColumnNotFound("x".into()));
+        assert!(first_string_or_bytes_lossy(s, b).is_none());
+    }
+
+    #[test]
+    fn first_string_or_bytes_lossy_decodes_invalid_utf8_with_replacement() {
+        let s: Result<String, sqlx::Error> =
+            Err(sqlx::Error::ColumnNotFound("x".into()));
+        // 0xFF is invalid UTF-8 — `from_utf8_lossy` substitutes the
+        // U+FFFD replacement char.
+        let b: Result<Vec<u8>, sqlx::Error> = Ok(vec![0xFF]);
+        let out = first_string_or_bytes_lossy(s, b).unwrap();
+        assert!(out.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn build_mysql_entry_drops_rows_missing_table_name() {
+        assert!(build_mysql_entry(
+            Some("public".into()),
+            None,
+            Some("id".into()),
+            Some("int".into()),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn build_mysql_entry_drops_rows_missing_column_name() {
+        assert!(build_mysql_entry(
+            Some("public".into()),
+            Some("users".into()),
+            None,
+            Some("int".into()),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn build_mysql_entry_passes_values_through_when_keys_present() {
+        let e = build_mysql_entry(
+            Some("public".into()),
+            Some("users".into()),
+            Some("id".into()),
+            Some("int".into()),
+        )
+        .unwrap();
+        assert_eq!(e.schema_name.as_deref(), Some("public"));
+        assert_eq!(e.table_name, "users");
+        assert_eq!(e.column_name, "id");
+        assert_eq!(e.data_type.as_deref(), Some("int"));
+    }
+
+    #[test]
+    fn build_mysql_entry_allows_missing_schema_and_type() {
+        let e = build_mysql_entry(
+            None,
+            Some("t".into()),
+            Some("c".into()),
+            None,
+        )
+        .unwrap();
+        assert!(e.schema_name.is_none());
+        assert!(e.data_type.is_none());
+    }
+
+    #[test]
+    fn introspect_sql_constants_target_information_schema_columns() {
+        // Sanity-check the SQL strings haven't drifted from their
+        // intended shape — guards against accidental refactors.
+        assert!(POSTGRES_INTROSPECT_SQL.contains("information_schema.columns"));
+        assert!(POSTGRES_INTROSPECT_SQL.contains("table_schema NOT IN"));
+        assert!(MYSQL_INTROSPECT_SQL.contains("DATABASE()"));
+        assert!(SQLITE_OBJECTS_SQL.contains("sqlite_master"));
     }
 
     #[tokio::test]
