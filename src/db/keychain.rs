@@ -104,6 +104,36 @@ pub fn resolve_value(db_value: &str, keychain_key: &str) -> Result<String, Strin
     }
 }
 
+/// Resolve a `{{keychain:NS:KEY}}` reference (ADR 0002 syntax) against
+/// the OS keychain. Returns:
+///
+/// - `Ok(Some(value))` when the reference points at a stored secret
+/// - `Ok(None)` when the reference is well-formed but the keychain
+///   has no entry (caller decides whether that's an error)
+/// - `Err(...)` for malformed input or backend errors
+///
+/// Non-keychain backends (`1password`, `pass`, `env`) are NOT handled
+/// here — they need their own resolvers that this module does not own.
+pub fn resolve_secret_ref(value: &str) -> Result<Option<String>, String> {
+    let trimmed = value.trim();
+    if !(trimmed.starts_with("{{") && trimmed.ends_with("}}")) {
+        return Err(format!("not a secret reference: {value}"));
+    }
+    let inner = &trimmed[2..trimmed.len() - 2];
+    let (backend, address) = inner
+        .split_once(':')
+        .ok_or_else(|| format!("malformed reference (no backend separator): {value}"))?;
+    if backend != "keychain" {
+        return Err(format!(
+            "secret backend `{backend}` is not handled by this resolver"
+        ));
+    }
+    if address.is_empty() {
+        return Err(format!("empty address in reference: {value}"));
+    }
+    get_secret(address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
