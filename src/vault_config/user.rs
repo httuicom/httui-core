@@ -207,6 +207,53 @@ prompt_timeout_s = 30
     }
 
     #[test]
+    fn ui_prefs_default_populates_every_field() {
+        let p = UiPrefs::default();
+        assert_eq!(p.theme, "system");
+        assert_eq!(p.font_family, "JetBrains Mono");
+        assert_eq!(p.font_size, 14);
+        assert_eq!(p.density, "comfortable");
+        assert_eq!(p.auto_save_ms, 1000);
+        assert_eq!(p.default_fetch_size, 100);
+        assert_eq!(p.history_retention, 10);
+        assert!(!p.vim_enabled);
+        assert!(p.sidebar_open);
+        assert_eq!(p.color_mode, "system");
+    }
+
+    #[test]
+    fn secrets_backend_default_matches_documented_values() {
+        let b = SecretsBackend::default();
+        assert_eq!(b.backend, "auto");
+        assert!(b.biometric);
+        assert_eq!(b.prompt_timeout_s, 60);
+    }
+
+    #[test]
+    fn empty_user_file_serialises_back_to_default_round_trip() {
+        let original: UserFile = toml::from_str("").unwrap();
+        let serialised = toml::to_string(&original).unwrap();
+        let reparsed: UserFile = toml::from_str(&serialised).unwrap();
+        assert_eq!(reparsed.ui.theme, "system");
+        assert_eq!(reparsed.ui.color_mode, "system");
+        assert_eq!(reparsed.secrets.backend, "auto");
+    }
+
+    #[test]
+    fn mcp_config_round_trips_servers_table() {
+        let raw = r#"
+version = "1"
+[mcp.servers."notes-mcp"]
+command = "httui-mcp"
+"#;
+        let f: UserFile = toml::from_str(raw).unwrap();
+        assert!(f.mcp.servers.contains_key("notes-mcp"));
+
+        let mcp_default = McpConfig::default();
+        assert!(mcp_default.servers.is_empty());
+    }
+
+    #[test]
     fn active_envs_round_trip() {
         let raw = r#"
 version = "1"
