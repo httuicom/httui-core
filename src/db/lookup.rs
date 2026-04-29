@@ -1,5 +1,3 @@
-// coverage:exclude file — DB pool/exec/lookup or vault-store registry. Coverage requires live DB integration tests; owned by Epic 32 (critical-path tests). Audit-027.
-
 //! Connection lookup abstraction. Decouples `PoolManager` from the
 //! concrete storage backend: production reads from
 //! `vault_config::ConnectionsStore` (file-backed), tests use a mock,
@@ -58,5 +56,53 @@ impl ConnectionLookup for SqliteLookup {
         // Legacy lookup accepted ids; allow either form to bridge the
         // gap during the cutover.
         super::connections::get_connection(&self.pool, key).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tempfile::TempDir;
+
+    async fn empty_pool() -> SqlitePool {
+        // Use the real init_db migrations so the `connections` schema
+        // exactly matches production. A tempdir keeps each test
+        // isolated.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("notes.db");
+        let pool = super::super::init_db(&path).await.unwrap();
+        // Leak the tempdir into the pool's lifetime — it lives until
+        // the pool is dropped at end of test, which keeps the
+        // db file around.
+        std::mem::forget(dir);
+        pool
+    }
+
+    #[tokio::test]
+    async fn sqlite_lookup_returns_none_for_unknown_key() {
+        let pool = empty_pool().await;
+        let lookup = SqliteLookup::new(pool);
+        let res = lookup.lookup("does-not-exist").await.unwrap();
+        assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_lookup_constructs_via_arc_helper() {
+        let pool = empty_pool().await;
+        let arc = SqliteLookup::new(pool);
+        // `new` returns an Arc — strong count starts at 1.
+        assert_eq!(Arc::strong_count(&arc), 1);
+    }
+
+    #[tokio::test]
+    async fn connections_store_lookup_returns_none_when_file_missing() {
+        // ConnectionsStore is the production lookup path. With an empty
+        // vault root (no `connections.toml`), `get_legacy` resolves to
+        // `Ok(None)`, so the trait impl mirrors the same shape.
+        let dir = TempDir::new().unwrap();
+        let store = ConnectionsStore::new(dir.path());
+        let res = ConnectionLookup::lookup(store.as_ref(), "missing").await.unwrap();
+        assert!(res.is_none());
     }
 }
