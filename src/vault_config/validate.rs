@@ -17,7 +17,7 @@ use std::fmt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::connections::{Connection, ConnectionsFile};
+use super::connections::ConnectionsFile;
 use super::envs::EnvFile;
 
 // ---- secret reference shape ------------------------------------------------
@@ -161,7 +161,7 @@ impl Report {
 
 // ---- value-level checks ----------------------------------------------------
 
-fn check_field(report: &mut Report, path: &str, name: &str, value: &str) {
+pub(super) fn check_field(report: &mut Report, path: &str, name: &str, value: &str) {
     if is_secret_ref(value) {
         return;
     }
@@ -226,85 +226,18 @@ pub fn validate_env_file(file: &EnvFile) -> Report {
 }
 
 /// Validate a `connections.toml` post-deserialization.
+///
+/// Per-variant field checks live on each `impl DbConnection` —
+/// adding a new connection type adds its own `validate_fields`
+/// override and this function dispatches automatically. SQLite, WS,
+/// gRPC, GraphQL, and Shell variants don't override (no
+/// conventionally-sensitive fields), so they fall through to the
+/// trait's default empty implementation.
 pub fn validate_connections_file(file: &ConnectionsFile) -> Report {
     let mut report = Report::default();
-
     for (name, conn) in &file.connections {
-        match conn {
-            Connection::Postgres(c) => {
-                let base = format!("[connections.{name}]");
-                check_field(&mut report, &format!("{base}.host"), "host", &c.host);
-                check_field(
-                    &mut report,
-                    &format!("{base}.database"),
-                    "database",
-                    &c.database,
-                );
-                check_field(&mut report, &format!("{base}.user"), "user", &c.user);
-                check_field(
-                    &mut report,
-                    &format!("{base}.password"),
-                    "password",
-                    &c.password,
-                );
-            }
-            Connection::Mysql(c) => {
-                let base = format!("[connections.{name}]");
-                check_field(&mut report, &format!("{base}.host"), "host", &c.host);
-                check_field(
-                    &mut report,
-                    &format!("{base}.database"),
-                    "database",
-                    &c.database,
-                );
-                check_field(&mut report, &format!("{base}.user"), "user", &c.user);
-                check_field(
-                    &mut report,
-                    &format!("{base}.password"),
-                    "password",
-                    &c.password,
-                );
-            }
-            Connection::Mongo(c) => {
-                let base = format!("[connections.{name}]");
-                check_field(&mut report, &format!("{base}.uri"), "uri", &c.uri);
-                if let Some(auth) = &c.auth {
-                    check_field(&mut report, &format!("{base}.auth"), "auth", auth);
-                }
-            }
-            Connection::Http(c) => {
-                let base = format!("[connections.{name}]");
-                for (header_name, header_value) in &c.default_headers {
-                    check_field(
-                        &mut report,
-                        &format!("{base}.default_headers.{header_name}"),
-                        header_name,
-                        header_value,
-                    );
-                }
-                let _ = &c.base_url;
-            }
-            Connection::Bigquery(c) => {
-                let base = format!("[connections.{name}]");
-                check_field(
-                    &mut report,
-                    &format!("{base}.credentials_path"),
-                    "credentials_path",
-                    &c.credentials_path,
-                );
-            }
-            Connection::Sqlite(_)
-            | Connection::Ws(_)
-            | Connection::Grpc(_)
-            | Connection::Graphql(_)
-            | Connection::Shell(_) => {
-                // SQLite is a path-only driver; the others have no
-                // conventionally-sensitive fields on their own.
-                // Header-bearing types (graphql) could grow checks later.
-            }
-        }
+        conn.as_dyn().validate_fields(name, &mut report);
     }
-
     report
 }
 

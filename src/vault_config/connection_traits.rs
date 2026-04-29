@@ -19,6 +19,7 @@ use super::connections::{
     BigqueryConfig, CommonFields, Connection, GraphqlConfig, GrpcConfig, HttpConfig, MongoConfig,
     MysqlConfig, PostgresConfig, ShellConfig, SqliteConfig, WsConfig,
 };
+use super::validate::{check_field, Report};
 
 /// Variant-uniform interface for `Connection` values.
 ///
@@ -65,6 +66,13 @@ pub trait DbConnection {
     fn password(&self) -> Option<&str> {
         None
     }
+
+    /// Per-variant schema validation: append findings to `report`.
+    /// Default: no checks. Override on variants that carry
+    /// sensitive-named fields (host/database/user/password/uri/etc).
+    /// `connection_name` is the TOML map key — used for `[connections.NAME]`
+    /// path prefixes in error messages.
+    fn validate_fields(&self, _connection_name: &str, _report: &mut Report) {}
 }
 
 // --- impl per variant ----------------------------------------------------
@@ -94,6 +102,13 @@ impl DbConnection for PostgresConfig {
     fn password(&self) -> Option<&str> {
         Some(&self.password)
     }
+    fn validate_fields(&self, name: &str, report: &mut Report) {
+        let base = format!("[connections.{name}]");
+        check_field(report, &format!("{base}.host"), "host", &self.host);
+        check_field(report, &format!("{base}.database"), "database", &self.database);
+        check_field(report, &format!("{base}.user"), "user", &self.user);
+        check_field(report, &format!("{base}.password"), "password", &self.password);
+    }
 }
 
 impl DbConnection for MysqlConfig {
@@ -118,6 +133,13 @@ impl DbConnection for MysqlConfig {
     fn password(&self) -> Option<&str> {
         Some(&self.password)
     }
+    fn validate_fields(&self, name: &str, report: &mut Report) {
+        let base = format!("[connections.{name}]");
+        check_field(report, &format!("{base}.host"), "host", &self.host);
+        check_field(report, &format!("{base}.database"), "database", &self.database);
+        check_field(report, &format!("{base}.user"), "user", &self.user);
+        check_field(report, &format!("{base}.password"), "password", &self.password);
+    }
 }
 
 impl DbConnection for SqliteConfig {
@@ -139,6 +161,13 @@ impl DbConnection for MongoConfig {
     fn common(&self) -> &CommonFields {
         &self.common
     }
+    fn validate_fields(&self, name: &str, report: &mut Report) {
+        let base = format!("[connections.{name}]");
+        check_field(report, &format!("{base}.uri"), "uri", &self.uri);
+        if let Some(auth) = &self.auth {
+            check_field(report, &format!("{base}.auth"), "auth", auth);
+        }
+    }
 }
 
 impl DbConnection for HttpConfig {
@@ -147,6 +176,17 @@ impl DbConnection for HttpConfig {
     }
     fn common(&self) -> &CommonFields {
         &self.common
+    }
+    fn validate_fields(&self, name: &str, report: &mut Report) {
+        let base = format!("[connections.{name}]");
+        for (header_name, header_value) in &self.default_headers {
+            check_field(
+                report,
+                &format!("{base}.default_headers.{header_name}"),
+                header_name,
+                header_value,
+            );
+        }
     }
 }
 
@@ -183,6 +223,15 @@ impl DbConnection for BigqueryConfig {
     }
     fn common(&self) -> &CommonFields {
         &self.common
+    }
+    fn validate_fields(&self, name: &str, report: &mut Report) {
+        let base = format!("[connections.{name}]");
+        check_field(
+            report,
+            &format!("{base}.credentials_path"),
+            "credentials_path",
+            &self.credentials_path,
+        );
     }
 }
 
