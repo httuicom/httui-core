@@ -5,6 +5,7 @@ pub mod block_settings;
 pub mod blocks;
 pub mod config;
 pub mod db;
+pub mod dotenv;
 pub mod error;
 pub mod executor;
 pub mod fs;
