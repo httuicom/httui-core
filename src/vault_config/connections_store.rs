@@ -613,8 +613,12 @@ fn resolve_password_ref(value: &str) -> Result<Option<String>, String> {
 // guard is intentionally held across awaits to keep concurrent test
 // runs deterministic. The lock is contention-free in practice (each
 // test holds it for milliseconds).
-#[allow(clippy::await_holding_lock)]
 mod tests {
+    // Inner attribute: clippy 1.95 stopped propagating the outer-attribute
+    // form to bodies of `#[tokio::test]` functions, so move the allow
+    // inside the module so it applies to every test function below.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use crate::db::keychain::KEYCHAIN_TEST_LOCK;
     use tempfile::TempDir;
