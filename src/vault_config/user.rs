@@ -25,6 +25,12 @@ pub struct UserFile {
 
     #[serde(default)]
     pub mcp: McpConfig,
+
+    /// Active environment per vault, keyed by absolute vault path.
+    /// Per-machine state — never committed to git. Read by
+    /// `EnvironmentsStore::active_env(vault_path)`.
+    #[serde(default)]
+    pub active_envs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,5 +143,23 @@ prompt_timeout_s = 30
         assert_eq!(f.ui.font_size, 14);
         assert_eq!(f.secrets.backend, "auto");
         assert!(f.secrets.biometric);
+        assert!(f.active_envs.is_empty());
+    }
+
+    #[test]
+    fn active_envs_round_trip() {
+        let raw = r#"
+version = "1"
+[active_envs]
+"/Users/me/work" = "staging"
+"/Users/me/personal" = "local"
+"#;
+        let f: UserFile = toml::from_str(raw).unwrap();
+        assert_eq!(f.active_envs.get("/Users/me/work").unwrap(), "staging");
+        assert_eq!(f.active_envs.get("/Users/me/personal").unwrap(), "local");
+
+        let serialized = toml::to_string(&f).unwrap();
+        let reparsed: UserFile = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.active_envs.len(), 2);
     }
 }

@@ -13,6 +13,7 @@
 pub mod atomic;
 pub mod connections;
 pub mod connections_store;
+pub mod environments_store;
 pub mod envs;
 pub mod user;
 pub mod validate;
@@ -21,6 +22,9 @@ pub mod workspace;
 pub use connections::{Connection, ConnectionsFile};
 pub use connections_store::{
     ConnectionPublic, ConnectionsStore, CreateConnectionInput, UpdateConnectionInput,
+};
+pub use environments_store::{
+    EnvVariablePublic, EnvironmentPublic, EnvironmentsStore, SetVarInput,
 };
 pub use envs::{EnvFile, EnvMeta};
 pub use user::UserFile;

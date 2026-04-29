@@ -609,6 +609,11 @@ fn resolve_password_ref(value: &str) -> Result<Option<String>, String> {
 }
 
 #[cfg(test)]
+// Tests serialize keychain access via KEYCHAIN_TEST_LOCK; the std Mutex
+// guard is intentionally held across awaits to keep concurrent test
+// runs deterministic. The lock is contention-free in practice (each
+// test holds it for milliseconds).
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::db::keychain::KEYCHAIN_TEST_LOCK;
