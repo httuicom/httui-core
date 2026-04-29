@@ -1,5 +1,7 @@
+#[cfg(not(test))]
 use keyring::Entry;
 
+#[cfg(not(test))]
 const SERVICE: &str = "httui-notes";
 
 /// Sentinel value stored in SQLite when the real value is in the keychain.
