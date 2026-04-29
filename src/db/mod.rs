@@ -6,6 +6,7 @@ pub mod lookup;
 pub mod pool_manager;
 pub mod query_error;
 pub mod schema_cache;
+pub mod sql_scanner;
 
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
