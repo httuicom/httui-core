@@ -84,6 +84,16 @@ fn build_pg_connect_options(conn: &Connection) -> Result<sqlx::postgres::PgConne
         .ssl_mode(ssl_mode))
 }
 
+/// True only for statements that can legally be wrapped in
+/// `SELECT * FROM (<sql>) LIMIT … OFFSET …` for pagination — i.e. real
+/// SELECTs and CTEs. EXPLAIN, PRAGMA, SHOW, DESCRIBE all return rows
+/// but are not subqueryable in any of the three drivers, so they must
+/// run as-is.
+pub(super) fn is_subqueryable_select(sql: &str) -> bool {
+    let trimmed = sql.trim_start().to_uppercase();
+    trimmed.starts_with("SELECT") || trimmed.starts_with("WITH")
+}
+
 // --- SQLite path validation (T03) ---
 
 pub(super) fn validate_sqlite_path(path: &str) -> Result<(), String> {
