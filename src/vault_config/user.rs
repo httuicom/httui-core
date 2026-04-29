@@ -61,11 +61,9 @@ pub struct UiPrefs {
     /// Sidebar open/closed. MVP `app_config` key: `sidebar_open`.
     #[serde(default = "default_sidebar_open")]
     pub sidebar_open: bool,
-    /// Color mode preference: `"system"` | `"light"` | `"dark"`. The
-    /// frontend wires this to Chakra's color mode + `<html class>` so
-    /// `lib/theme.ts` semanticTokens resolve via `_dark` / `_light`.
-    /// Distinct from `theme` (legacy customisation JSON; pending
-    /// reframe in Epic 19 Story 01 sweep).
+    /// Color mode: `"system" | "light" | "dark"`. Frontend wires it
+    /// to Chakra/next-themes via `<ColorModeSync>`. Separate from
+    /// `theme` (legacy customisation JSON pending Epic 19 sweep).
     #[serde(default = "default_color_mode")]
     pub color_mode: String,
 }
@@ -237,6 +235,56 @@ prompt_timeout_s = 30
         assert_eq!(reparsed.ui.theme, "system");
         assert_eq!(reparsed.ui.color_mode, "system");
         assert_eq!(reparsed.secrets.backend, "auto");
+    }
+
+    #[test]
+    fn each_default_fn_returns_documented_value() {
+        // serde's `#[serde(default = "fn_name")]` calls each fn via
+        // the function-pointer path; coverage tools sometimes miss
+        // those hits, so call them directly. Doubles as a contract
+        // check that the documented defaults haven't drifted.
+        assert_eq!(default_theme(), "system");
+        assert_eq!(default_font_family(), "JetBrains Mono");
+        assert_eq!(default_font_size(), 14);
+        assert_eq!(default_density(), "comfortable");
+        assert_eq!(default_auto_save_ms(), 1000);
+        assert_eq!(default_fetch_size(), 100);
+        assert_eq!(default_history_retention(), 10);
+        assert!(default_sidebar_open());
+        assert_eq!(default_color_mode(), "system");
+        assert_eq!(default_backend(), "auto");
+        assert!(default_biometric());
+        assert_eq!(default_prompt_timeout(), 60);
+    }
+
+    #[test]
+    fn derived_traits_compile_and_run() {
+        // Exercises the macro-generated Debug + Clone impls so the
+        // `#[derive(...)]` lines are hit by the coverage tool. Cheap
+        // smoke that catches accidental drift in the derive set.
+        let p = UiPrefs::default();
+        let cloned = p.clone();
+        assert_eq!(p.theme, cloned.theme);
+        let debug = format!("{p:?}");
+        assert!(debug.contains("UiPrefs"));
+
+        let s = SecretsBackend::default();
+        let s_clone = s.clone();
+        assert_eq!(s.backend, s_clone.backend);
+        let s_debug = format!("{s:?}");
+        assert!(s_debug.contains("SecretsBackend"));
+
+        let m = McpConfig::default();
+        let m_clone = m.clone();
+        assert_eq!(m.servers.len(), m_clone.servers.len());
+        let m_debug = format!("{m:?}");
+        assert!(m_debug.contains("McpConfig"));
+
+        let f = UserFile::default();
+        let f_clone = f.clone();
+        assert_eq!(f.ui.theme, f_clone.ui.theme);
+        let f_debug = format!("{f:?}");
+        assert!(f_debug.contains("UserFile"));
     }
 
     #[test]
