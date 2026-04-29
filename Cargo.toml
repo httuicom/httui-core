@@ -24,7 +24,7 @@ trash = "5"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 sha2 = "0.10"
 tokio-util = "0.7"
-thiserror = "1"
+thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 percent-encoding = "2"
 toml = "0.8"
