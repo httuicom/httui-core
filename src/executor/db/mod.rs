@@ -21,6 +21,15 @@ struct DbParams {
     #[serde(default = "default_fetch_size")]
     fetch_size: u32,
     timeout_ms: Option<u64>,
+    /// `explain=true` info-string token (Epic 53 Story 01). When set,
+    /// the user's SQL is prefixed with the driver's `EXPLAIN ANALYZE …
+    /// FORMAT JSON` form via `crate::explain::prefix_explain_sql`, the
+    /// query runs once, and the JSON plan is extracted from the result
+    /// into `DbResponse.plan`. Single-statement queries only;
+    /// drivers without EXPLAIN support (SQLite, BigQuery, Snowflake)
+    /// surface `ExplainError::Unsupported` verbatim to the consumer.
+    #[serde(default)]
+    explain: bool,
 }
 
 fn default_fetch_size() -> u32 {
@@ -71,9 +80,27 @@ impl DbExecutor {
                 .unwrap_or(30_000)
         };
 
+        // EXPLAIN swap (Epic 53 Story 01). When `explain=true`, replace
+        // the user's SQL with the driver-prefixed form so the executor
+        // returns the plan instead of the regular result set. Reject
+        // multi-statement up-front — `EXPLAIN ANALYZE` over a script
+        // doesn't compose with the per-statement scanner.
+        let working_query = if p.explain {
+            let parts = crate::db::connections::split_statements(&p.query);
+            if parts.len() != 1 {
+                return Err(ExecutorError(
+                    "EXPLAIN requires a single statement".to_string(),
+                ));
+            }
+            crate::explain::prefix_explain_sql(pool.driver(), &p.query)
+                .map_err(|e| ExecutorError(e.to_string()))?
+        } else {
+            p.query.clone()
+        };
+
         // Split the query on SQL-aware `;` boundaries. Single-statement
         // queries produce a 1-element vec — same as before.
-        let statements = crate::db::connections::split_statements(&p.query);
+        let statements = crate::db::connections::split_statements(&working_query);
         if statements.is_empty() {
             return Err(ExecutorError("query is empty".to_string()));
         }
@@ -187,15 +214,80 @@ impl DbExecutor {
 
         let results = results?;
 
+        // EXPLAIN extraction (Epic 53 Story 01). The helper short-
+        // circuits when `explain=false`; when true, it pulls the JSON
+        // plan from the single-row result the driver returned and
+        // applies the 200 KB cap. Calling unconditionally keeps the
+        // executor body uniform — the gating lives inside the helper
+        // where it's reachable from unit tests on both branches.
+        let plan = compute_plan(p.explain, &results);
+
         Ok(DbResponse {
             results,
             messages: Vec::new(),
-            plan: None,
+            plan,
             stats: crate::executor::db::types::DbStats {
                 elapsed_ms: duration_ms,
                 rows_streamed: None,
             },
         })
+    }
+}
+
+/// Top-level helper called from the executor body. Returns `None`
+/// unless the user opted in via `explain=true`; otherwise delegates
+/// to `extract_plan_from_results`. Wrapping the gate in its own fn
+/// keeps the both branches reachable from unit tests without needing
+/// a real Postgres/MySQL pool.
+fn compute_plan(
+    explain: bool,
+    results: &[crate::executor::db::types::DbResult],
+) -> Option<serde_json::Value> {
+    if !explain {
+        return None;
+    }
+    extract_plan_from_results(results)
+}
+
+/// Extract the EXPLAIN plan from a result vec. Postgres `EXPLAIN
+/// (FORMAT JSON)` returns a single-row, single-column result whose
+/// value is a JSON `[{"Plan": …}]` array. MySQL `EXPLAIN FORMAT=JSON`
+/// returns the JSON as text in `EXPLAIN`-named column. We pull row 0,
+/// take the first column value, parse it if it came back as a string,
+/// and apply the 200 KB cap. When the body overflows the cap, the
+/// truncated form is stored as `serde_json::Value::String` so the
+/// consumer can still display a notice (and detects the truncation
+/// via the type shape).
+fn extract_plan_from_results(
+    results: &[crate::executor::db::types::DbResult],
+) -> Option<serde_json::Value> {
+    use crate::executor::db::types::DbResult;
+    let first = results.first()?;
+    let DbResult::Select { rows, .. } = first else {
+        return None;
+    };
+    let row_obj = rows.first()?.as_object()?;
+    let raw_value = row_obj.values().next()?;
+
+    // Normalize to a JSON-ish Value. Postgres returns the plan already
+    // as a JSON array (sqlx maps the json column → Value); MySQL hands
+    // it back as a JSON string.
+    let parsed: serde_json::Value = match raw_value {
+        serde_json::Value::String(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+        }
+        other => other.clone(),
+    };
+
+    // Apply the 200 KB cap on the serialized form. When over, store the
+    // truncated text as a string Value so the consumer can detect the
+    // truncation by `typeof` shape.
+    let serialized = parsed.to_string();
+    let (capped, truncated) = crate::explain::cap_explain_body(&serialized);
+    if truncated {
+        Some(serde_json::Value::String(capped))
+    } else {
+        Some(parsed)
     }
 }
 
@@ -719,5 +811,246 @@ mod tests {
             }
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    // ───── Epic 53 Story 01: explain wiring ─────
+
+    #[tokio::test]
+    async fn test_explain_on_sqlite_returns_unsupported_error() {
+        // SQLite is explicitly unsupported per Epic 53 spec — the
+        // prefix builder errors out and the executor surfaces the
+        // driver name to the consumer.
+        let (manager, conn_id) = setup_test_env().await;
+        let executor = DbExecutor::new(manager);
+        let err = executor
+            .execute_with_cancel(
+                serde_json::json!({
+                    "connection_id": conn_id,
+                    "query": "SELECT 1",
+                    "explain": true,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.0.contains("sqlite"),
+            "expected sqlite in unsupported message, got: {}",
+            err.0
+        );
+        assert!(
+            err.0.to_lowercase().contains("explain"),
+            "expected EXPLAIN in unsupported message, got: {}",
+            err.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explain_rejects_multi_statement_query() {
+        let (manager, conn_id) = setup_test_env().await;
+        let executor = DbExecutor::new(manager);
+        let err = executor
+            .execute_with_cancel(
+                serde_json::json!({
+                    "connection_id": conn_id,
+                    "query": "SELECT 1; SELECT 2",
+                    "explain": true,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.0.contains("single statement"),
+            "expected single-statement error, got: {}",
+            err.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_run_omits_plan() {
+        // Without `explain=true`, `DbResponse.plan` stays None — the
+        // shape regression guard for legacy consumers.
+        let (manager, conn_id) = setup_test_env().await;
+        let pool = manager.get_pool(&conn_id).await.unwrap();
+        match pool.as_ref() {
+            crate::db::connections::DatabasePool::Sqlite(p) => {
+                sqlx::query("CREATE TABLE t (n INTEGER)")
+                    .execute(p)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO t VALUES (1)")
+                    .execute(p)
+                    .await
+                    .unwrap();
+            }
+            _ => panic!("expected SQLite pool"),
+        }
+        let executor = DbExecutor::new(manager);
+        let resp = executor
+            .execute_with_cancel(
+                serde_json::json!({
+                    "connection_id": conn_id,
+                    "query": "SELECT * FROM t",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.plan.is_none());
+    }
+
+    // ───── Pure-helper tests for `extract_plan_from_results` ─────
+
+    #[test]
+    fn extract_plan_from_postgres_shape_returns_parsed_value() {
+        // Postgres `EXPLAIN (FORMAT JSON)` returns a single row whose
+        // single column is the JSON plan as a JSON value (sqlx maps the
+        // json column → serde_json::Value).
+        let plan_value = serde_json::json!([{
+            "Plan": {
+                "Node Type": "Seq Scan",
+                "Total Cost": 12.5
+            }
+        }]);
+        let row = serde_json::json!({ "QUERY PLAN": plan_value });
+        let results = vec![crate::executor::db::types::DbResult::Select {
+            columns: vec![crate::db::connections::ColumnInfo {
+                name: "QUERY PLAN".into(),
+                type_name: "json".into(),
+            }],
+            rows: vec![row],
+            has_more: false,
+        }];
+        let extracted = extract_plan_from_results(&results).unwrap();
+        // Round-trip: same value, untruncated, parsed (Array shape).
+        assert!(extracted.is_array());
+        assert_eq!(extracted[0]["Plan"]["Node Type"], "Seq Scan");
+    }
+
+    #[test]
+    fn extract_plan_from_mysql_shape_parses_string() {
+        // MySQL hands the JSON back as text, not a json column.
+        let plan_text = r#"{"query_block": {"select_id": 1}}"#;
+        let row = serde_json::json!({ "EXPLAIN": plan_text });
+        let results = vec![crate::executor::db::types::DbResult::Select {
+            columns: vec![crate::db::connections::ColumnInfo {
+                name: "EXPLAIN".into(),
+                type_name: "text".into(),
+            }],
+            rows: vec![row],
+            has_more: false,
+        }];
+        let extracted = extract_plan_from_results(&results).unwrap();
+        assert!(extracted.is_object());
+        assert_eq!(extracted["query_block"]["select_id"], 1);
+    }
+
+    #[test]
+    fn extract_plan_falls_back_to_string_when_unparseable() {
+        // Defensive: if the driver hands back a string that isn't valid
+        // JSON, store it as-is so the consumer can still display it.
+        let row = serde_json::json!({ "QUERY PLAN": "not json at all" });
+        let results = vec![crate::executor::db::types::DbResult::Select {
+            columns: vec![crate::db::connections::ColumnInfo {
+                name: "QUERY PLAN".into(),
+                type_name: "text".into(),
+            }],
+            rows: vec![row],
+            has_more: false,
+        }];
+        let extracted = extract_plan_from_results(&results).unwrap();
+        assert_eq!(extracted, serde_json::json!("not json at all"));
+    }
+
+    #[test]
+    fn extract_plan_caps_oversized_payload() {
+        // Build a plan whose serialized form exceeds the 200 KB cap.
+        // The truncated form is stored as a string Value so consumers
+        // can detect the truncation by `typeof` shape.
+        let huge: String = "a".repeat(crate::explain::EXPLAIN_BODY_CAP + 8_000);
+        let row = serde_json::json!({ "QUERY PLAN": huge });
+        let results = vec![crate::executor::db::types::DbResult::Select {
+            columns: vec![crate::db::connections::ColumnInfo {
+                name: "QUERY PLAN".into(),
+                type_name: "text".into(),
+            }],
+            rows: vec![row],
+            has_more: false,
+        }];
+        let extracted = extract_plan_from_results(&results).unwrap();
+        let serde_json::Value::String(s) = extracted else {
+            panic!("expected truncated string fallback");
+        };
+        assert!(s.len() <= crate::explain::EXPLAIN_BODY_CAP);
+        assert!(s.ends_with("[explain payload truncated]"));
+    }
+
+    #[test]
+    fn extract_plan_returns_none_on_empty_results() {
+        let results: Vec<crate::executor::db::types::DbResult> = Vec::new();
+        assert!(extract_plan_from_results(&results).is_none());
+    }
+
+    #[test]
+    fn extract_plan_returns_none_on_mutation_or_error() {
+        let results = vec![crate::executor::db::types::DbResult::Mutation { rows_affected: 1 }];
+        assert!(extract_plan_from_results(&results).is_none());
+
+        let results = vec![crate::executor::db::types::DbResult::Error {
+            message: "boom".into(),
+            line: None,
+            column: None,
+        }];
+        assert!(extract_plan_from_results(&results).is_none());
+    }
+
+    #[test]
+    fn extract_plan_returns_none_on_empty_rows() {
+        let results = vec![crate::executor::db::types::DbResult::Select {
+            columns: vec![crate::db::connections::ColumnInfo {
+                name: "QUERY PLAN".into(),
+                type_name: "json".into(),
+            }],
+            rows: Vec::new(),
+            has_more: false,
+        }];
+        assert!(extract_plan_from_results(&results).is_none());
+    }
+
+    // ───── compute_plan gate ─────
+
+    #[test]
+    fn compute_plan_short_circuits_when_explain_false() {
+        // Even when `results` is plan-shaped, the gate returns None
+        // unless the user opted in. Guards a regular SELECT with one
+        // row + one TEXT column from being misread as a plan.
+        let plan_value = serde_json::json!([{ "Plan": { "Node Type": "Seq Scan" } }]);
+        let row = serde_json::json!({ "QUERY PLAN": plan_value });
+        let results = vec![crate::executor::db::types::DbResult::Select {
+            columns: vec![crate::db::connections::ColumnInfo {
+                name: "QUERY PLAN".into(),
+                type_name: "json".into(),
+            }],
+            rows: vec![row],
+            has_more: false,
+        }];
+        assert!(compute_plan(false, &results).is_none());
+    }
+
+    #[test]
+    fn compute_plan_extracts_when_explain_true() {
+        let plan_value = serde_json::json!([{ "Plan": { "Node Type": "Index Scan" } }]);
+        let row = serde_json::json!({ "QUERY PLAN": plan_value });
+        let results = vec![crate::executor::db::types::DbResult::Select {
+            columns: vec![crate::db::connections::ColumnInfo {
+                name: "QUERY PLAN".into(),
+                type_name: "json".into(),
+            }],
+            rows: vec![row],
+            has_more: false,
+        }];
+        let extracted = compute_plan(true, &results).unwrap();
+        assert_eq!(extracted[0]["Plan"]["Node Type"], "Index Scan");
     }
 }
