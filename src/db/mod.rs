@@ -11,6 +11,7 @@ pub mod pool_exec_sqlite;
 pub mod pool_manager;
 pub mod query_error;
 pub mod schema_cache;
+pub mod schema_cache_remote;
 pub mod sql_scanner;
 
 use serde::Serialize;

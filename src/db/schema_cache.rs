@@ -3,6 +3,7 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 
 use super::connections::{DatabasePool, PoolManager};
+use super::schema_cache_remote::{introspect_mysql, introspect_postgres};
 
 // --- SQL queries (constants so tests can assert their shape) ---------------
 
@@ -178,25 +179,6 @@ pub fn build_pg_entry(
     }
 }
 
-async fn introspect_postgres(pool: &sqlx::PgPool) -> Result<Vec<SchemaEntry>, String> {
-    let rows = sqlx::query(POSTGRES_INTROSPECT_SQL)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(rows
-        .iter()
-        .map(|row| {
-            build_pg_entry(
-                row.try_get::<String, _>("table_schema").ok(),
-                row.get("table_name"),
-                row.get("column_name"),
-                row.try_get("data_type").ok(),
-            )
-        })
-        .collect())
-}
-
 /// Pure decoder for MySQL "either UTF-8 String or raw bytes" columns.
 /// Some MySQL proxies (notably ProxySQL) return information_schema
 /// text columns as VARBINARY, which fails `String` decoding. Falls
@@ -219,13 +201,6 @@ pub fn first_string_or_bytes_lossy(
     None
 }
 
-fn mysql_str(row: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
-    first_string_or_bytes_lossy(
-        row.try_get::<String, _>(col),
-        row.try_get::<Vec<u8>, _>(col),
-    )
-}
-
 /// Build a [`SchemaEntry`] from the four values [`MYSQL_INTROSPECT_SQL`]
 /// returns, after mysql_str decoding. Returns `None` when either
 /// `table_name` or `column_name` is missing — those are the keys that
@@ -243,25 +218,6 @@ pub fn build_mysql_entry(
         column_name: column_name?,
         data_type,
     })
-}
-
-async fn introspect_mysql(pool: &sqlx::MySqlPool) -> Result<Vec<SchemaEntry>, String> {
-    let rows = sqlx::query(MYSQL_INTROSPECT_SQL)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(rows
-        .iter()
-        .filter_map(|row| {
-            build_mysql_entry(
-                mysql_str(row, "TABLE_SCHEMA"),
-                mysql_str(row, "TABLE_NAME"),
-                mysql_str(row, "COLUMN_NAME"),
-                mysql_str(row, "DATA_TYPE"),
-            )
-        })
-        .collect())
 }
 
 #[cfg(test)]
