@@ -128,7 +128,9 @@ mod tests {
     fn list_remotes_returns_origin_after_remote_add() {
         let dir = TempDir::new().unwrap();
         init_repo(dir.path());
-        let r = Command::new("git")
+        let mut cmd = Command::new("git");
+        super::super::scrub_git_env(&mut cmd);
+        let r = cmd
             .arg("-C")
             .arg(dir.path())
             .args(["remote", "add", "origin", "git@github.com:owner/repo.git"])

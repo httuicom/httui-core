@@ -41,28 +41,25 @@ pub fn git_commit(vault: &Path, message: &str, amend: bool) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
+    use super::super::scrub_git_env;
     use super::super::test_helpers::{commit_all, init_repo};
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
 
+    fn git_at(p: &Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new("git");
+        scrub_git_env(&mut cmd);
+        cmd.arg("-C").arg(p).args(args).output().unwrap()
+    }
+
     fn rev_parse_head(p: &Path) -> String {
-        let r = Command::new("git")
-            .arg("-C")
-            .arg(p)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
+        let r = git_at(p, &["rev-parse", "HEAD"]);
         String::from_utf8_lossy(&r.stdout).trim().to_string()
     }
 
     fn status_porcelain(p: &Path) -> String {
-        let r = Command::new("git")
-            .arg("-C")
-            .arg(p)
-            .args(["status", "--porcelain"])
-            .output()
-            .unwrap();
+        let r = git_at(p, &["status", "--porcelain"]);
         String::from_utf8_lossy(&r.stdout).to_string()
     }
 
@@ -116,12 +113,7 @@ mod tests {
         std::fs::write(dir.path().join("a"), "y").unwrap();
         stage_path(dir.path(), "a").unwrap();
         git_commit(dir.path(), "", true).unwrap();
-        let r = Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(["log", "-1", "--pretty=%s"])
-            .output()
-            .unwrap();
+        let r = git_at(dir.path(), &["log", "-1", "--pretty=%s"]);
         assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "first");
     }
 

@@ -63,6 +63,16 @@ fn evaluate_file_exists(path: &str, vault_root: &Path) -> CheckResult {
 }
 
 fn evaluate_command(command: &str) -> CheckResult {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    evaluate_command_with_path(command, &path_var)
+}
+
+/// PATH-injectable variant — the production path goes through
+/// [`evaluate_command`] which reads `$PATH` once. This split exists
+/// so tests can pass a fabricated PATH without mutating the
+/// process-global env (which would race under `cargo test`'s
+/// parallel runner).
+fn evaluate_command_with_path(command: &str, path_var: &std::ffi::OsStr) -> CheckResult {
     let exe = match command.split_whitespace().next() {
         Some(token) if !token.is_empty() => token,
         _ => {
@@ -82,7 +92,7 @@ fn evaluate_command(command: &str) -> CheckResult {
             },
         };
     }
-    if which_in_path(exe) {
+    if which_in_path(exe, path_var) {
         CheckResult::Pass
     } else {
         CheckResult::Fail {
@@ -91,12 +101,8 @@ fn evaluate_command(command: &str) -> CheckResult {
     }
 }
 
-fn which_in_path(exe: &str) -> bool {
-    let path_var = match std::env::var_os("PATH") {
-        Some(v) => v,
-        None => return false,
-    };
-    for dir in std::env::split_paths(&path_var) {
+fn which_in_path(exe: &str, path_var: &std::ffi::OsStr) -> bool {
+    for dir in std::env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
@@ -251,10 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn command_passes_when_executable_in_path() {
-        // Build a temp dir, put an executable "myfaketool" in it,
-        // override PATH for the duration of the test, and assert
-        // the command resolves.
+    fn which_in_path_finds_executable_in_supplied_path() {
+        // No env mutation — pass a fabricated PATH directly so the
+        // test stays parallel-safe under cargo test / cargo llvm-cov.
         let dir = tempdir().unwrap();
         let exe_name = if cfg!(windows) {
             "myfaketool.exe"
@@ -270,53 +275,52 @@ mod tests {
             perms.set_mode(0o755);
             fs::set_permissions(&exe_path, perms).unwrap();
         }
-        let original = std::env::var_os("PATH");
-        std::env::set_var("PATH", dir.path());
-        let envs = HashSet::new();
-        let conns = HashSet::new();
-        let keys = HashSet::new();
-        let ctx = empty_ctx(&envs, &conns, &keys);
-        let r = evaluate_preflight_with_io(
-            &[PreflightItem::Command {
-                command: "myfaketool --help".into(),
-            }],
-            &ctx,
-            dir.path(),
-        );
-        // Restore PATH before any assert that could panic.
-        match original {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        assert_eq!(r[0], CheckResult::Pass);
+        let path_var = dir.path().as_os_str();
+        let r = evaluate_command_with_path("myfaketool --help", path_var);
+        assert_eq!(r, CheckResult::Pass);
     }
 
     #[test]
-    fn command_fails_when_not_in_path() {
-        let dir = tempdir().unwrap();
-        let original = std::env::var_os("PATH");
-        std::env::set_var("PATH", dir.path()); // empty dir
-        let envs = HashSet::new();
-        let conns = HashSet::new();
-        let keys = HashSet::new();
-        let ctx = empty_ctx(&envs, &conns, &keys);
-        let r = evaluate_preflight_with_io(
-            &[PreflightItem::Command {
-                command: "definitely-not-installed-xyz".into(),
-            }],
-            &ctx,
-            dir.path(),
+    fn which_in_path_fails_when_executable_not_under_supplied_path() {
+        let dir = tempdir().unwrap(); // empty
+        let path_var = dir.path().as_os_str();
+        let r = evaluate_command_with_path(
+            "definitely-not-installed-xyz",
+            path_var,
         );
-        match original {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        if let CheckResult::Fail { reason } = &r[0] {
+        if let CheckResult::Fail { reason } = &r {
             assert!(reason.contains("definitely-not-installed-xyz"));
             assert!(reason.contains("PATH"));
         } else {
-            panic!("expected Fail, got {:?}", r[0]);
+            panic!("expected Fail, got {r:?}");
         }
+    }
+
+    #[test]
+    fn which_in_path_skips_empty_segments() {
+        let dir = tempdir().unwrap();
+        let exe_name = if cfg!(windows) { "tool.exe" } else { "tool" };
+        let exe = dir.path().join(exe_name);
+        fs::write(&exe, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&exe).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&exe, perms).unwrap();
+        }
+        // Insert empty path segments around the real one — they
+        // should be skipped, not treated as cwd-relative.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let mut path_str = String::new();
+        path_str.push_str(sep);
+        path_str.push_str(&dir.path().to_string_lossy());
+        path_str.push_str(sep);
+        let r = evaluate_command_with_path(
+            "tool --version",
+            std::ffi::OsStr::new(&path_str),
+        );
+        assert_eq!(r, CheckResult::Pass);
     }
 
     #[test]

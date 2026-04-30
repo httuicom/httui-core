@@ -33,11 +33,16 @@ use std::process::{Command, Output};
 
 /// Run `git -C <vault> <args...>` and capture stdout. Errors carry
 /// stderr verbatim so the UI can show what `git` actually said.
+///
+/// Defensively clears the per-invocation `GIT_*` env vars that a
+/// parent `git` process (e.g. when this binary runs inside a git
+/// hook) injects to point children at the parent's index/work-tree
+/// — those would override `-C` and silently target the wrong repo.
 pub(crate) fn run_git<P: AsRef<Path>>(vault: P, args: &[&str]) -> Result<String, String> {
-    let output: Output = Command::new("git")
-        .arg("-C")
-        .arg(vault.as_ref())
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(vault.as_ref()).args(args);
+    scrub_git_env(&mut cmd);
+    let output: Output = cmd
         .output()
         .map_err(|e| format!("git invocation failed: {e}"))?;
 
@@ -55,16 +60,43 @@ pub(crate) fn run_git<P: AsRef<Path>>(vault: P, args: &[&str]) -> Result<String,
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Strip the env vars `git` itself sets when running inside a hook
+/// or alias. Without this, `Command::new("git")` children inherit
+/// `GIT_DIR` (etc.) from the host repo and ignore our `-C <path>`
+/// — production-side latent bug, test-side reliable failure mode.
+pub(crate) fn scrub_git_env(cmd: &mut Command) {
+    for var in [
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_EDITOR",
+    ] {
+        cmd.env_remove(var);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_helpers {
+    use super::scrub_git_env;
     use std::path::Path;
     use std::process::Command;
+
+    fn git() -> Command {
+        let mut c = Command::new("git");
+        scrub_git_env(&mut c);
+        c
+    }
 
     /// Initialise a temporary git repo at `path`, configure
     /// non-interactive identity, return the path. Caller keeps the
     /// `TempDir` alive.
     pub fn init_repo(path: &Path) {
-        let init = Command::new("git").arg("init").arg(path).output().unwrap();
+        let init = git().arg("init").arg(path).output().unwrap();
         assert!(init.status.success(), "git init failed");
         for (k, v) in [
             ("user.email", "test@httui.local"),
@@ -72,7 +104,7 @@ pub(crate) mod test_helpers {
             ("commit.gpgsign", "false"),
             ("init.defaultBranch", "main"),
         ] {
-            let r = Command::new("git")
+            let r = git()
                 .arg("-C")
                 .arg(path)
                 .args(["config", k, v])
@@ -85,14 +117,14 @@ pub(crate) mod test_helpers {
     /// Stage and commit everything currently in the working tree.
     /// Returns the resulting commit's full SHA.
     pub fn commit_all(path: &Path, message: &str) -> String {
-        let add = Command::new("git")
+        let add = git()
             .arg("-C")
             .arg(path)
             .args(["add", "-A"])
             .output()
             .unwrap();
         assert!(add.status.success(), "git add failed");
-        let cm = Command::new("git")
+        let cm = git()
             .arg("-C")
             .arg(path)
             .args(["commit", "-m", message])
@@ -103,7 +135,7 @@ pub(crate) mod test_helpers {
             "git commit failed: {}",
             String::from_utf8_lossy(&cm.stderr)
         );
-        let rev = Command::new("git")
+        let rev = git()
             .arg("-C")
             .arg(path)
             .args(["rev-parse", "HEAD"])

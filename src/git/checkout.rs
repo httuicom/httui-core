@@ -38,13 +38,8 @@ mod tests {
         std::fs::write(dir.path().join("a"), "x").unwrap();
         commit_all(dir.path(), "init");
         git_checkout_b(dir.path(), "feat/x").unwrap();
-        let head = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "feat/x");
+        let head = head_branch(dir.path());
+        assert_eq!(head, "feat/x");
     }
 
     #[test]
@@ -55,13 +50,20 @@ mod tests {
         commit_all(dir.path(), "init");
         git_checkout_b(dir.path(), "feat/x").unwrap();
         git_checkout(dir.path(), "main").unwrap();
-        let head = std::process::Command::new("git")
+        let head = head_branch(dir.path());
+        assert_eq!(head, "main");
+    }
+
+    fn head_branch(p: &std::path::Path) -> String {
+        let mut cmd = std::process::Command::new("git");
+        super::super::scrub_git_env(&mut cmd);
+        let out = cmd
             .arg("-C")
-            .arg(dir.path())
+            .arg(p)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .output()
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "main");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     #[test]

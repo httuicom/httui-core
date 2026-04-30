@@ -6,6 +6,7 @@
 //! git said. No auth handling at this layer — the user's git
 //! credential helper / SSH agent does the work.
 
+use super::scrub_git_env;
 use std::path::Path;
 use std::process::Command;
 
@@ -13,10 +14,10 @@ use std::process::Command;
 /// regardless of success/failure. Network ops produce useful
 /// progress text on stderr that the consumer wants to see.
 fn run_sync(vault: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(vault)
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(vault).args(args);
+    scrub_git_env(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("git invocation failed: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -122,17 +123,16 @@ mod tests {
         // Set up two repos: a "remote" bare repo and a working
         // repo that adds the bare repo as origin.
         let remote = TempDir::new().unwrap();
-        Command::new("git")
-            .arg("init")
-            .arg("--bare")
-            .arg(remote.path())
-            .output()
-            .unwrap();
+        let mut init = Command::new("git");
+        scrub_git_env(&mut init);
+        init.arg("init").arg("--bare").arg(remote.path()).output().unwrap();
         let local = TempDir::new().unwrap();
         init_repo(local.path());
         std::fs::write(local.path().join("a"), "x").unwrap();
         commit_all(local.path(), "init");
-        Command::new("git")
+        let mut add_remote = Command::new("git");
+        scrub_git_env(&mut add_remote);
+        add_remote
             .arg("-C")
             .arg(local.path())
             .args(["remote", "add", "origin"])
