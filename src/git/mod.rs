@@ -66,6 +66,7 @@ pub(crate) fn run_git<P: AsRef<Path>>(vault: P, args: &[&str]) -> Result<String,
 /// — production-side latent bug, test-side reliable failure mode.
 pub(crate) fn scrub_git_env(cmd: &mut Command) {
     for var in [
+        // Per-invocation overrides that re-target the repo.
         "GIT_DIR",
         "GIT_INDEX_FILE",
         "GIT_WORK_TREE",
@@ -75,6 +76,15 @@ pub(crate) fn scrub_git_env(cmd: &mut Command) {
         "GIT_NAMESPACE",
         "GIT_PREFIX",
         "GIT_EDITOR",
+        // Identity overrides that bypass `[user]` config — set when
+        // running inside a `git commit` hook so the child commits
+        // would otherwise impersonate the host's author/committer.
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_AUTHOR_DATE",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_COMMITTER_DATE",
     ] {
         cmd.env_remove(var);
     }
