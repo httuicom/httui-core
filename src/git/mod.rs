@@ -13,9 +13,11 @@
 //! that will land alongside the panel UI.
 
 pub mod log;
+pub mod remote_host;
 pub mod status;
 
 pub use log::{git_log, CommitInfo};
+pub use remote_host::{parse_remote_url, ParsedRemote, RemoteHost};
 pub use status::{git_branch_list, git_diff, git_status, BranchInfo, GitStatus};
 
 use std::path::Path;
