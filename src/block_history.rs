@@ -45,6 +45,12 @@ pub struct HistoryEntry {
     pub elapsed_ms: Option<i64>,
     pub outcome: String,
     pub ran_at: String,
+    /// `EXPLAIN`-flavoured JSON plan when the SQL block carried
+    /// `explain=true`. Capped via `crate::explain::cap_explain_body`
+    /// (200 KB). `None` for regular runs and any non-SQL block.
+    /// Epic 53 Story 01 (migration 012).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +64,8 @@ pub struct InsertEntry {
     pub response_size: Option<i64>,
     pub elapsed_ms: Option<i64>,
     pub outcome: String,
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 /// Insert a new history entry and trim the oldest rows for the same
@@ -70,8 +78,8 @@ pub async fn insert_history_entry(
     sqlx::query(
         "INSERT INTO block_run_history (
             file_path, block_alias, method, url_canonical, status,
-            request_size, response_size, elapsed_ms, outcome, ran_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            request_size, response_size, elapsed_ms, outcome, ran_at, plan
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&entry.file_path)
     .bind(&entry.block_alias)
@@ -83,6 +91,7 @@ pub async fn insert_history_entry(
     .bind(entry.elapsed_ms)
     .bind(&entry.outcome)
     .bind(&now)
+    .bind(&entry.plan)
     .execute(pool)
     .await?;
 
@@ -129,10 +138,11 @@ pub async fn list_history(
             Option<i64>,
             String,
             String,
+            Option<String>,
         ),
     >(
         "SELECT id, file_path, block_alias, method, url_canonical, status,
-                request_size, response_size, elapsed_ms, outcome, ran_at
+                request_size, response_size, elapsed_ms, outcome, ran_at, plan
          FROM block_run_history
          WHERE file_path = ? AND block_alias = ?
          ORDER BY ran_at DESC
@@ -158,6 +168,7 @@ pub async fn list_history(
             elapsed_ms: r.8,
             outcome: r.9,
             ran_at: r.10,
+            plan: r.11,
         })
         .collect())
 }
@@ -215,7 +226,8 @@ mod tests {
                 response_size INTEGER,
                 elapsed_ms INTEGER,
                 outcome TEXT NOT NULL,
-                ran_at TEXT NOT NULL
+                ran_at TEXT NOT NULL,
+                plan TEXT
             )",
         )
         .execute(&pool)
@@ -235,6 +247,7 @@ mod tests {
             response_size: Some(42),
             elapsed_ms: Some(100),
             outcome: "success".to_string(),
+            plan: None,
         }
     }
 
@@ -293,6 +306,59 @@ mod tests {
                 .len(),
             1,
         );
+    }
+
+    #[tokio::test]
+    async fn plan_blob_round_trips_when_present() {
+        let pool = setup().await;
+        let mut e = entry("POST", 200);
+        e.plan = Some(r#"[{"Plan":{"Node Type":"Seq Scan"}}]"#.into());
+        insert_history_entry(&pool, e).await.unwrap();
+        let rows = list_history(&pool, "/notes/test.md", "req1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].plan.as_deref(),
+            Some(r#"[{"Plan":{"Node Type":"Seq Scan"}}]"#),
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_defaults_to_none_for_regular_runs() {
+        let pool = setup().await;
+        insert_history_entry(&pool, entry("GET", 200)).await.unwrap();
+        let rows = list_history(&pool, "/notes/test.md", "req1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_serializes_with_skip_none() {
+        let entry = HistoryEntry {
+            id: 1,
+            file_path: "x.md".into(),
+            block_alias: "a".into(),
+            method: "GET".into(),
+            url_canonical: "/".into(),
+            status: Some(200),
+            request_size: None,
+            response_size: None,
+            elapsed_ms: None,
+            outcome: "success".into(),
+            ran_at: "2026-04-30T16:00:00Z".into(),
+            plan: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        // None fields are skipped so the existing TS interface
+        // (which doesn't yet declare `plan?: string`) keeps
+        // accepting the same shape.
+        assert!(!json.contains("\"plan\""));
+
+        let with_plan = HistoryEntry {
+            plan: Some("{}".into()),
+            ..entry
+        };
+        let json2 = serde_json::to_string(&with_plan).unwrap();
+        assert!(json2.contains("\"plan\":\"{}\""));
     }
 
     #[tokio::test]
