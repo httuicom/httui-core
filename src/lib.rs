@@ -8,6 +8,7 @@ pub mod db;
 pub mod dotenv;
 pub mod error;
 pub mod executor;
+pub mod frontmatter;
 pub mod fs;
 pub mod git;
 pub mod paths;
