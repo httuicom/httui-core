@@ -12,6 +12,7 @@ pub mod frontmatter;
 pub mod fs;
 pub mod git;
 pub mod paths;
+pub mod preflight;
 pub mod references;
 pub mod runner;
 pub mod search;
