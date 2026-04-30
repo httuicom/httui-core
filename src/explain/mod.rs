@@ -12,8 +12,10 @@ pub mod mongo;
 pub mod mysql;
 pub mod node;
 pub mod postgres;
+pub mod prefix;
 
 pub use mongo::parse_mongo_explain;
 pub use mysql::parse_mysql_explain;
 pub use node::PlanNode;
 pub use postgres::parse_postgres_explain;
+pub use prefix::{cap_explain_body, prefix_explain_sql, ExplainError, EXPLAIN_BODY_CAP};
