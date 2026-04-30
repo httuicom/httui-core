@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_handles_multiple_input_stages_via_inputStages() {
+    fn parse_handles_multiple_input_stages_via_input_stages() {
         // OR-style queries fan out via inputStages.
         let json = r#"{
             "queryPlanner": {
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_target_falls_back_to_keyPattern_when_no_indexName() {
+    fn parse_target_falls_back_to_key_pattern_when_no_index_name() {
         let json = r#"{
             "queryPlanner": {
                 "winningPlan": {
@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_uses_nReturned_when_present_else_docsExamined() {
+    fn parse_uses_n_returned_when_present_else_docs_examined() {
         let json_n = r#"{"queryPlanner":{"winningPlan":{"stage":"FETCH","nReturned":42}}}"#;
         assert_eq!(parse(json_n).unwrap().rows, 42);
         let json_d = r#"{"queryPlanner":{"winningPlan":{"stage":"FETCH","docsExamined":7}}}"#;
