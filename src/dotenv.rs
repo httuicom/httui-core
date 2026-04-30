@@ -178,6 +178,72 @@ pub fn classify(key: &str, value: &str) -> EntryKind {
     EntryKind::Plain
 }
 
+// --- Placeholder heuristic ---------------------------------------------
+
+/// Literal placeholder values commonly used in `.env.example` files.
+/// Lower-cased on comparison so case differences don't bypass the
+/// heuristic.
+const PLACEHOLDER_LITERALS: &[&str] = &[
+    "change_me",
+    "change-me",
+    "changeme",
+    "replace_me",
+    "replace-me",
+    "replaceme",
+    "placeholder",
+    "example",
+    "dummy",
+    "todo",
+    "tbd",
+];
+
+/// Matches three or more consecutive `x` characters (case-insensitive
+/// — covered by the `(?i)` flag) so values like `sk_test_xxxxxxxxx`
+/// or `XXXXXXXX` flag as placeholders.
+static PLACEHOLDER_X_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)x{3,}").expect("placeholder regex compiles"));
+
+/// True when `value` looks like a placeholder (`<...>`, `xxx…`, a
+/// `your_*` / `your-*` prefix, or a known literal). Empty values are
+/// **not** treated as placeholders — they're valid for opt-in flags.
+fn is_placeholder_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.len() >= 2 {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    if PLACEHOLDER_LITERALS.contains(&lower.as_str()) {
+        return true;
+    }
+    if lower.starts_with("your_") || lower.starts_with("your-") {
+        return true;
+    }
+    PLACEHOLDER_X_RE.is_match(trimmed)
+}
+
+/// Heuristic flag for "this looks like a `.env.example` template
+/// rather than a real `.env`". Used by the auto-discovery scanner to
+/// avoid prompting the user to import generic placeholder files.
+///
+/// Returns `true` when at least half of `entries` carry
+/// placeholder-shaped values (`<...>`, three-plus `x`s, `your_*`,
+/// `change_me`, `replace_me`, `placeholder`, `example`, `dummy`,
+/// `todo`, `tbd`). Empty or single-entry inputs return `false` so
+/// the caller doesn't drop legitimately tiny `.env` files.
+pub fn is_likely_placeholder_file(entries: &[DotenvEntry]) -> bool {
+    if entries.len() < 2 {
+        return false;
+    }
+    let placeholder_count = entries
+        .iter()
+        .filter(|e| is_placeholder_value(&e.value))
+        .count();
+    placeholder_count * 2 >= entries.len()
+}
+
 // --- Scanner -----------------------------------------------------------
 
 /// Filenames recognised as `.env`-style by the auto-discovery scanner.
@@ -246,9 +312,13 @@ fn scan_dir(dir: &Path, out: &mut Vec<DotenvFile>) {
             continue;
         };
         let entries = parse_dotenv(&content);
-        if !entries.is_empty() {
-            out.push(DotenvFile { path, entries });
+        if entries.is_empty() {
+            continue;
         }
+        if is_likely_placeholder_file(&entries) {
+            continue;
+        }
+        out.push(DotenvFile { path, entries });
     }
 }
 
@@ -509,5 +579,135 @@ WEBHOOK_TOKEN='abc-def-123'
         let found = scan_dotenv_files(&missing);
 
         assert!(found.is_empty());
+    }
+
+    // --- Placeholder heuristic tests -----------------------------------
+
+    fn entry(key: &str, value: &str) -> DotenvEntry {
+        DotenvEntry {
+            key: key.into(),
+            value: value.into(),
+            kind: classify(key, value),
+        }
+    }
+
+    #[test]
+    fn placeholder_value_flags_angle_brackets() {
+        assert!(is_placeholder_value("<DATABASE_PASSWORD>"));
+        assert!(is_placeholder_value("<your secret>"));
+        // `<>` alone — len is 2, no inner content but still classifies
+        // as a placeholder shape (the regex demands len ≥ 2).
+        assert!(is_placeholder_value("<>"));
+        // A leading `<` without closing brace stays plain.
+        assert!(!is_placeholder_value("<incomplete"));
+    }
+
+    #[test]
+    fn placeholder_value_flags_xxx_runs() {
+        assert!(is_placeholder_value("xxx"));
+        assert!(is_placeholder_value("XXXXXXXX"));
+        assert!(is_placeholder_value("sk_test_xxxxxxxxxxxx"));
+        // Two x's stays plain — the regex demands 3+.
+        assert!(!is_placeholder_value("xx"));
+    }
+
+    #[test]
+    fn placeholder_value_flags_your_prefix_and_literals() {
+        for raw in [
+            "your_token",
+            "your-secret",
+            "change_me",
+            "REPLACE-ME",
+            "Placeholder",
+            "example",
+            "DUMMY",
+            "todo",
+            "tbd",
+        ] {
+            assert!(
+                is_placeholder_value(raw),
+                "expected `{raw}` to flag as placeholder",
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_value_keeps_empty_and_real_values() {
+        assert!(!is_placeholder_value(""));
+        assert!(!is_placeholder_value("   "));
+        assert!(!is_placeholder_value("postgres://u:p@h/d"));
+        assert!(!is_placeholder_value("info"));
+        assert!(!is_placeholder_value("5432"));
+        // Just `your` without underscore/dash boundary doesn't trigger.
+        assert!(!is_placeholder_value("yours"));
+    }
+
+    #[test]
+    fn placeholder_file_flags_at_half_threshold() {
+        // 2 placeholder + 2 real: ratio 50% — flagged.
+        let entries = vec![
+            entry("DB", "<your-db>"),
+            entry("TOKEN", "xxxxxxxx"),
+            entry("PORT", "5432"),
+            entry("HOST", "localhost"),
+        ];
+        assert!(is_likely_placeholder_file(&entries));
+    }
+
+    #[test]
+    fn placeholder_file_keeps_minority_placeholder() {
+        // 1 placeholder + 3 real: ratio 25% — NOT flagged.
+        let entries = vec![
+            entry("DB", "postgres://u:p@h/d"),
+            entry("TOKEN", "sk_live_real_value"),
+            entry("PORT", "5432"),
+            entry("API", "<your-api>"),
+        ];
+        assert!(!is_likely_placeholder_file(&entries));
+    }
+
+    #[test]
+    fn placeholder_file_handles_short_inputs() {
+        // Empty list → not a placeholder file.
+        assert!(!is_likely_placeholder_file(&[]));
+        // Single placeholder entry → not flagged (avoids tossing tiny
+        // legit `.env`s with one half-baked entry).
+        assert!(!is_likely_placeholder_file(&[entry("X", "<insert>")]));
+    }
+
+    #[test]
+    fn scanner_skips_placeholder_dotenv_files() {
+        let dir = tempdir().expect("tempdir");
+        // `.env` is mostly placeholders — should be skipped.
+        let placeholder = "DB=<your-db-url>\nTOKEN=xxxxxxxx\nKEY=<INSERT>\n";
+        stdfs::write(dir.path().join(".env"), placeholder).unwrap();
+
+        let found = scan_dotenv_files(dir.path());
+
+        assert!(
+            found.is_empty(),
+            "placeholder-only .env should be skipped, got {found:?}",
+        );
+    }
+
+    #[test]
+    fn scanner_keeps_real_dotenv_alongside_skipped_example() {
+        let dir = tempdir().expect("tempdir");
+        // `.env` has real values; `.env.example` is a placeholder template.
+        stdfs::write(
+            dir.path().join(".env"),
+            "DATABASE_URL=postgres://u:p@h/d\nLOG_LEVEL=info\nPORT=8080\n",
+        )
+        .unwrap();
+        stdfs::write(
+            dir.path().join(".env.example"),
+            "DATABASE_URL=<your-db-url>\nLOG_LEVEL=<level>\nPORT=<port>\n",
+        )
+        .unwrap();
+
+        let found = scan_dotenv_files(dir.path());
+
+        assert_eq!(found.len(), 1, "only the real .env should land");
+        assert!(found[0].path.ends_with(".env"));
     }
 }
