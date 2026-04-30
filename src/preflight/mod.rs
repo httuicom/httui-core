@@ -13,7 +13,9 @@
 //! `preflight:` section without touching the generic YAML parser.
 
 pub mod evaluator;
+pub mod io_evaluator;
 pub mod parser;
 
 pub use evaluator::{evaluate_preflight, CheckResult, EvaluationContext};
+pub use io_evaluator::evaluate_preflight_with_io;
 pub use parser::{parse_preflight, PreflightItem};

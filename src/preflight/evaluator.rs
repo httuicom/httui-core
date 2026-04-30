@@ -52,7 +52,7 @@ pub fn evaluate_preflight(
     items.iter().map(|item| evaluate_one(item, ctx)).collect()
 }
 
-fn evaluate_one(item: &PreflightItem, ctx: &EvaluationContext<'_>) -> CheckResult {
+pub(crate) fn evaluate_one(item: &PreflightItem, ctx: &EvaluationContext<'_>) -> CheckResult {
     match item {
         PreflightItem::Connection { name } => {
             if ctx.connections.contains(name) {
