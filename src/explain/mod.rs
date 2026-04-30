@@ -8,8 +8,10 @@
 //! each driver's JSON shape into the same `PlanNode` shape so the
 //! UI doesn't fan out per backend.
 
+pub mod mysql;
 pub mod node;
 pub mod postgres;
 
+pub use mysql::parse_mysql_explain;
 pub use node::PlanNode;
 pub use postgres::parse_postgres_explain;
