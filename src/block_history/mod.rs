@@ -140,6 +140,66 @@ pub async fn list_history(
         .collect())
 }
 
+/// Return the most recent N entries for a single file across all
+/// aliases. Used by Epic 29 sidebar History tab to show every run
+/// inside the active runbook without an N+1 IPC fan-out from the
+/// frontend. Output is most-recent-first; cap is the per-(file,
+/// alias) retention multiplied by a small constant so a busy doc
+/// with many blocks still surfaces a sensible window.
+pub async fn list_history_for_file(
+    pool: &SqlitePool,
+    file_path: &str,
+    limit: i64,
+) -> Result<Vec<HistoryEntry>, sqlx::Error> {
+    let effective_limit = if limit > 0 { limit } else { 50 };
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        "SELECT id, file_path, block_alias, method, url_canonical, status,
+                request_size, response_size, elapsed_ms, outcome, ran_at, plan
+         FROM block_run_history
+         WHERE file_path = ?
+         ORDER BY ran_at DESC
+         LIMIT ?",
+    )
+    .bind(file_path)
+    .bind(effective_limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| HistoryEntry {
+            id: r.0,
+            file_path: r.1,
+            block_alias: r.2,
+            method: r.3,
+            url_canonical: r.4,
+            status: r.5,
+            request_size: r.6,
+            response_size: r.7,
+            elapsed_ms: r.8,
+            outcome: r.9,
+            ran_at: r.10,
+            plan: r.11,
+        })
+        .collect())
+}
+
 /// Delete all history rows for a (file, alias). Called when a block is
 /// deleted from the document or a note is removed.
 pub async fn purge_history(
@@ -448,6 +508,69 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(cloned.id, 1);
         assert_eq!(cloned.plan.as_deref(), Some("[]"));
+    }
+
+    #[tokio::test]
+    async fn list_history_for_file_aggregates_across_aliases() {
+        let pool = setup().await;
+        // Insert 2 entries for alpha + 1 for beta in the same file.
+        let mut a = entry("GET", 200);
+        a.block_alias = "alpha".into();
+        insert_history_entry(&pool, a.clone()).await.unwrap();
+        insert_history_entry(&pool, a).await.unwrap();
+        let mut b = entry("POST", 201);
+        b.block_alias = "beta".into();
+        insert_history_entry(&pool, b).await.unwrap();
+        // A row in a different file shouldn't surface.
+        let mut other = entry("GET", 200);
+        other.file_path = "/other.md".into();
+        other.block_alias = "alpha".into();
+        insert_history_entry(&pool, other).await.unwrap();
+
+        let rows = list_history_for_file(&pool, "/notes/test.md", 50)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        // Most-recent-first: the last inserted one (beta POST) is on top.
+        assert_eq!(rows[0].block_alias, "beta");
+    }
+
+    #[tokio::test]
+    async fn list_history_for_file_respects_explicit_limit() {
+        let pool = setup().await;
+        for i in 0..6 {
+            insert_history_entry(&pool, entry("GET", 200 + i)).await.unwrap();
+        }
+        let rows = list_history_for_file(&pool, "/notes/test.md", 3)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_history_for_file_falls_back_to_50_when_limit_non_positive() {
+        let pool = setup().await;
+        for i in 0..3 {
+            insert_history_entry(&pool, entry("GET", 200 + i)).await.unwrap();
+        }
+        // limit <= 0 → effective fallback of 50; 3 inserted rows fit easily.
+        let rows = list_history_for_file(&pool, "/notes/test.md", 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let rows_neg = list_history_for_file(&pool, "/notes/test.md", -10)
+            .await
+            .unwrap();
+        assert_eq!(rows_neg.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_history_for_file_returns_empty_when_no_rows() {
+        let pool = setup().await;
+        let rows = list_history_for_file(&pool, "/empty.md", 50)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     #[tokio::test]
