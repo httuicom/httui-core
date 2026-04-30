@@ -12,11 +12,13 @@
 //! foundation commit — they need progress reporting + auth flows
 //! that will land alongside the panel UI.
 
+pub mod checkout;
 pub mod log;
 pub mod remote;
 pub mod remote_host;
 pub mod status;
 
+pub use checkout::{git_checkout, git_checkout_b};
 pub use log::{git_log, CommitInfo};
 pub use remote::{git_remote_list, Remote};
 pub use remote_host::{parse_remote_url, ParsedRemote, RemoteHost};
