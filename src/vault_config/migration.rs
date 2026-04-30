@@ -20,15 +20,51 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
 
 use super::connections_store::CreateConnectionInput;
 use super::environments_store::SetVarInput;
+use super::layout::WORKSPACE_DIR;
 use super::user::UiPrefs;
 use super::user_store::UserStore;
 use super::{ConnectionsStore, EnvironmentsStore};
 use crate::config;
 use crate::db::{connections, environments};
+
+/// Legacy MVP database filename. Detected at the vault root by
+/// [`detect_migration_candidate`]; not part of the v1 layout
+/// contract (which is why this constant lives in the migration
+/// module rather than `layout.rs`).
+pub const LEGACY_DB_FILE: &str = "notes.db";
+
+/// What the empty-state banner needs to know about a vault to decide
+/// whether to surface the MVP-to-v1 migration prompt.
+///
+/// `should_prompt()` is `true` iff a legacy `notes.db` is present
+/// and the v1 `.httui/` layout has *not* been initialised. The
+/// frontend gates the banner on this AND the
+/// `mvp_migration_dismissed` user pref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationCandidate {
+    pub has_legacy_db: bool,
+    pub has_v1_layout: bool,
+}
+
+impl MigrationCandidate {
+    pub fn should_prompt(&self) -> bool {
+        self.has_legacy_db && !self.has_v1_layout
+    }
+}
+
+/// Inspect `vault_path` and report what's there. Pure aside from the
+/// two filesystem stat calls; no side effects.
+pub fn detect_migration_candidate(vault_path: &Path) -> MigrationCandidate {
+    MigrationCandidate {
+        has_legacy_db: vault_path.join(LEGACY_DB_FILE).is_file(),
+        has_v1_layout: vault_path.join(WORKSPACE_DIR).is_dir(),
+    }
+}
 
 /// Per-call options. Build via [`MigrationOptions::default`] and
 /// override what you need.
@@ -322,6 +358,89 @@ mod tests {
     use super::*;
     use crate::db::init_db;
     use tempfile::TempDir;
+
+    // --- Detection tests (Epic 41 Story 07 carry slice 2) ----------------
+
+    #[test]
+    fn detect_returns_neither_for_empty_vault() {
+        let tmp = TempDir::new().unwrap();
+        let r = detect_migration_candidate(tmp.path());
+        assert!(!r.has_legacy_db);
+        assert!(!r.has_v1_layout);
+        assert!(!r.should_prompt());
+    }
+
+    #[test]
+    fn detect_flags_legacy_db_when_notes_db_present() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("notes.db"), b"").unwrap();
+        let r = detect_migration_candidate(tmp.path());
+        assert!(r.has_legacy_db);
+        assert!(!r.has_v1_layout);
+        assert!(r.should_prompt(), "legacy db without v1 layout = prompt");
+    }
+
+    #[test]
+    fn detect_flags_v1_layout_when_dot_httui_dir_present() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".httui")).unwrap();
+        let r = detect_migration_candidate(tmp.path());
+        assert!(!r.has_legacy_db);
+        assert!(r.has_v1_layout);
+        assert!(!r.should_prompt());
+    }
+
+    #[test]
+    fn detect_does_not_prompt_when_both_present() {
+        // Mid-migration / dual-state: vault has both. Don't prompt;
+        // the v1 layout already absorbed (or is in the process of
+        // absorbing) the legacy data.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("notes.db"), b"").unwrap();
+        std::fs::create_dir(tmp.path().join(".httui")).unwrap();
+        let r = detect_migration_candidate(tmp.path());
+        assert!(r.has_legacy_db);
+        assert!(r.has_v1_layout);
+        assert!(!r.should_prompt());
+    }
+
+    #[test]
+    fn detect_ignores_notes_db_directory() {
+        // A directory named `notes.db` should NOT count as the
+        // legacy database — `is_file` is the right check.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("notes.db")).unwrap();
+        let r = detect_migration_candidate(tmp.path());
+        assert!(!r.has_legacy_db);
+    }
+
+    #[test]
+    fn detect_ignores_dot_httui_when_it_is_a_file() {
+        // Symmetric guard for the v1 layout check.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".httui"), b"").unwrap();
+        let r = detect_migration_candidate(tmp.path());
+        assert!(!r.has_v1_layout);
+    }
+
+    #[test]
+    fn detect_handles_nonexistent_vault_path() {
+        // Caller might pass a path that hasn't been created yet
+        // (e.g. user typed a freshly-picked folder). Don't panic;
+        // report neither.
+        let tmp = TempDir::new().unwrap();
+        let phantom = tmp.path().join("does-not-exist");
+        let r = detect_migration_candidate(&phantom);
+        assert!(!r.has_legacy_db);
+        assert!(!r.has_v1_layout);
+    }
+
+    #[test]
+    fn legacy_db_file_constant_is_notes_db() {
+        assert_eq!(LEGACY_DB_FILE, "notes.db");
+    }
+
+    // --- Existing migration tests below ----------------------------------
 
     /// Setup helper: fresh SQLite + populated with one connection,
     /// one environment, two vars (one secret).
