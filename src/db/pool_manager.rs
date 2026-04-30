@@ -1,5 +1,3 @@
-// coverage:exclude file — DB pool/exec/lookup or vault-store registry. Coverage requires live DB integration tests; owned by Epic 32 (critical-path tests). Audit-027.
-
 //! Pool lifecycle, TTL eviction, status emission.
 //!
 //! Extracted from `db::connections` (Epic 20a Story 01 — first split).
@@ -192,5 +190,254 @@ impl PoolManager {
         // emerges — out of scope for v1 (audit-015 Phase 3 decision).
 
         Ok(())
+    }
+
+    /// Test-only seeding of cache entries — bypasses `create_pool` so
+    /// cache methods (`invalidate`, `cleanup_expired`, `get_query_timeout`)
+    /// can be unit-tested without standing up a live PG/MySQL pool.
+    #[cfg(test)]
+    pub(crate) async fn insert_for_test(
+        &self,
+        connection_id: &str,
+        name: &str,
+        pool: Arc<DatabasePool>,
+        last_used: Instant,
+        ttl_seconds: u64,
+        query_timeout_ms: u64,
+    ) {
+        let mut pools = self.pools.write().await;
+        pools.insert(
+            connection_id.to_string(),
+            PoolEntry {
+                pool,
+                name: name.to_string(),
+                last_used,
+                ttl_seconds,
+                query_timeout_ms,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cache_size(&self) -> usize {
+        self.pools.read().await.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    /// Minimal `ConnectionLookup` impl that always returns Ok(None) —
+    /// stand-in for the cache-only tests where lookup isn't exercised.
+    struct NoopLookup;
+
+    #[async_trait::async_trait]
+    impl ConnectionLookup for NoopLookup {
+        async fn lookup(
+            &self,
+            _key: &str,
+        ) -> Result<Option<crate::db::connections::Connection>, String> {
+            Ok(None)
+        }
+    }
+
+    /// Capturing emitter — counts the calls so `invalidate` /
+    /// `cleanup_expired` can assert "we did emit once".
+    struct CountingEmitter {
+        calls: AtomicUsize,
+    }
+
+    impl StatusEmitter for CountingEmitter {
+        fn emit_connection_status(&self, _: &str, _: &str, _: &str) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn memory_app_pool() -> SqlitePool {
+        SqlitePool::connect("sqlite::memory:").await.unwrap()
+    }
+
+    async fn memory_target_pool() -> Arc<DatabasePool> {
+        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        Arc::new(DatabasePool::Sqlite(p))
+    }
+
+    #[tokio::test]
+    async fn new_standalone_starts_with_empty_cache_and_no_emitter() {
+        let app = memory_app_pool().await;
+        let mgr = PoolManager::new_standalone(Arc::new(NoopLookup), app);
+        assert_eq!(mgr.cache_size().await, 0);
+        assert!(mgr.emitter.is_none());
+    }
+
+    #[tokio::test]
+    async fn new_with_emitter_holds_emitter() {
+        let app = memory_app_pool().await;
+        let emitter = Arc::new(CountingEmitter {
+            calls: AtomicUsize::new(0),
+        });
+        let mgr = PoolManager::new_with_emitter(Arc::new(NoopLookup), app, emitter);
+        assert!(mgr.emitter.is_some());
+    }
+
+    #[tokio::test]
+    async fn app_pool_returns_borrow_of_inner_pool() {
+        let app = memory_app_pool().await;
+        let mgr = PoolManager::new_standalone(Arc::new(NoopLookup), app);
+        // Use it to run a query — proves we got a working pool back.
+        let row: (i32,) = sqlx::query_as("SELECT 1")
+            .fetch_one(mgr.app_pool())
+            .await
+            .unwrap();
+        assert_eq!(row.0, 1);
+    }
+
+    #[tokio::test]
+    async fn invalidate_removes_entry_and_emits_disconnected() {
+        let app = memory_app_pool().await;
+        let emitter = Arc::new(CountingEmitter {
+            calls: AtomicUsize::new(0),
+        });
+        let mgr = PoolManager::new_with_emitter(Arc::new(NoopLookup), app, emitter.clone());
+
+        let pool = memory_target_pool().await;
+        mgr.insert_for_test("c1", "test-conn", pool, Instant::now(), 60, 30_000)
+            .await;
+        assert_eq!(mgr.cache_size().await, 1);
+
+        mgr.invalidate("c1").await;
+        assert_eq!(mgr.cache_size().await, 0);
+        assert_eq!(emitter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn invalidate_unknown_id_is_a_noop_no_emit() {
+        let app = memory_app_pool().await;
+        let emitter = Arc::new(CountingEmitter {
+            calls: AtomicUsize::new(0),
+        });
+        let mgr = PoolManager::new_with_emitter(Arc::new(NoopLookup), app, emitter.clone());
+        mgr.invalidate("nope").await;
+        assert_eq!(emitter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invalidate_without_emitter_drops_silently() {
+        let app = memory_app_pool().await;
+        let mgr = PoolManager::new_standalone(Arc::new(NoopLookup), app);
+        let pool = memory_target_pool().await;
+        mgr.insert_for_test("c1", "x", pool, Instant::now(), 60, 30_000)
+            .await;
+        mgr.invalidate("c1").await;
+        assert_eq!(mgr.cache_size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_drops_entries_past_ttl_and_emits_each() {
+        let app = memory_app_pool().await;
+        let emitter = Arc::new(CountingEmitter {
+            calls: AtomicUsize::new(0),
+        });
+        let mgr = PoolManager::new_with_emitter(Arc::new(NoopLookup), app, emitter.clone());
+
+        let stale = Instant::now() - Duration::from_secs(120);
+        let fresh = Instant::now();
+        let p1 = memory_target_pool().await;
+        let p2 = memory_target_pool().await;
+        let p3 = memory_target_pool().await;
+
+        mgr.insert_for_test("expired-1", "a", p1, stale, 60, 30_000).await;
+        mgr.insert_for_test("expired-2", "b", p2, stale, 60, 30_000).await;
+        mgr.insert_for_test("fresh", "c", p3, fresh, 60, 30_000).await;
+        assert_eq!(mgr.cache_size().await, 3);
+
+        mgr.cleanup_expired().await;
+
+        assert_eq!(mgr.cache_size().await, 1);
+        assert_eq!(emitter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_with_only_fresh_entries_is_a_noop() {
+        let app = memory_app_pool().await;
+        let mgr = PoolManager::new_standalone(Arc::new(NoopLookup), app);
+        let pool = memory_target_pool().await;
+        mgr.insert_for_test("fresh", "x", pool, Instant::now(), 300, 30_000)
+            .await;
+        mgr.cleanup_expired().await;
+        assert_eq!(mgr.cache_size().await, 1);
+    }
+
+    #[tokio::test]
+    async fn get_query_timeout_returns_cached_value_or_none() {
+        let app = memory_app_pool().await;
+        let mgr = PoolManager::new_standalone(Arc::new(NoopLookup), app);
+        let pool = memory_target_pool().await;
+        mgr.insert_for_test("c1", "x", pool, Instant::now(), 60, 12_345)
+            .await;
+        assert_eq!(mgr.get_query_timeout("c1").await, Some(12_345));
+        assert_eq!(mgr.get_query_timeout("missing").await, None);
+    }
+
+    #[tokio::test]
+    async fn get_pool_returns_not_found_when_lookup_returns_none() {
+        let app = memory_app_pool().await;
+        let mgr = PoolManager::new_standalone(Arc::new(NoopLookup), app);
+        match mgr.get_pool("missing").await {
+            Ok(_) => panic!("expected not-found error"),
+            Err(e) => assert!(e.contains("not found"), "got: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_pool_serves_cached_entry_without_calling_lookup() {
+        let app = memory_app_pool().await;
+        // NoopLookup would error if called; serving from cache must
+        // bypass it entirely.
+        let mgr = PoolManager::new_standalone(Arc::new(NoopLookup), app);
+        let pool = memory_target_pool().await;
+        mgr.insert_for_test("c1", "x", pool.clone(), Instant::now(), 60, 30_000)
+            .await;
+        let returned = mgr.get_pool("c1").await.unwrap();
+        // Same Arc as inserted
+        assert!(Arc::ptr_eq(&returned, &pool));
+    }
+
+    #[tokio::test]
+    async fn cleanup_query_log_drops_old_rows_and_caps_recent() {
+        let app = memory_app_pool().await;
+        sqlx::query(
+            r#"CREATE TABLE query_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )"#,
+        )
+        .execute(&app)
+        .await
+        .unwrap();
+        // 5 old (>30 days) + 5 recent rows
+        for _ in 0..5 {
+            sqlx::query("INSERT INTO query_log (created_at) VALUES (datetime('now', '-60 days'))")
+                .execute(&app)
+                .await
+                .unwrap();
+        }
+        for _ in 0..5 {
+            sqlx::query("INSERT INTO query_log (created_at) VALUES (datetime('now'))")
+                .execute(&app)
+                .await
+                .unwrap();
+        }
+        let mgr = PoolManager::new_standalone(Arc::new(NoopLookup), app.clone());
+        mgr.cleanup_query_log().await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(&app)
+            .await
+            .unwrap();
+        assert_eq!(count, 5, "old rows should be deleted, recent ones kept");
     }
 }
