@@ -15,6 +15,7 @@ pub mod references;
 pub mod runner;
 pub mod search;
 pub mod secrets;
+pub mod var_uses;
 pub mod vault_config;
 pub mod vaults;
 
