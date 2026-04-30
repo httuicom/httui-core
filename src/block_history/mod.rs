@@ -9,8 +9,11 @@
 //! (file_path, alias) keeping only the most recent N (default 10). Cap is
 //! a private constant — a global retention setting can be wired later.
 
-use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+
+pub mod types;
+
+pub use types::{HistoryEntry, InsertEntry};
 
 const DEFAULT_HISTORY_CAP: i64 = 10;
 const RETENTION_KEY: &str = "history_retention";
@@ -30,42 +33,6 @@ async fn get_retention(pool: &SqlitePool) -> i64 {
         Some(n) if n > 0 => n,
         _ => DEFAULT_HISTORY_CAP,
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistoryEntry {
-    pub id: i64,
-    pub file_path: String,
-    pub block_alias: String,
-    pub method: String,
-    pub url_canonical: String,
-    pub status: Option<i64>,
-    pub request_size: Option<i64>,
-    pub response_size: Option<i64>,
-    pub elapsed_ms: Option<i64>,
-    pub outcome: String,
-    pub ran_at: String,
-    /// `EXPLAIN`-flavoured JSON plan when the SQL block carried
-    /// `explain=true`. Capped via `crate::explain::cap_explain_body`
-    /// (200 KB). `None` for regular runs and any non-SQL block.
-    /// Epic 53 Story 01 (migration 012).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InsertEntry {
-    pub file_path: String,
-    pub block_alias: String,
-    pub method: String,
-    pub url_canonical: String,
-    pub status: Option<i64>,
-    pub request_size: Option<i64>,
-    pub response_size: Option<i64>,
-    pub elapsed_ms: Option<i64>,
-    pub outcome: String,
-    #[serde(default)]
-    pub plan: Option<String>,
 }
 
 /// Insert a new history entry and trim the oldest rows for the same
