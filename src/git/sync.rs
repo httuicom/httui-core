@@ -1,0 +1,148 @@
+//! `git fetch` / `git pull` / `git push` — sync ops for Epic 48
+//! Story 05.
+//!
+//! All three shell out to `git` and surface its output (stdout +
+//! stderr) verbatim so the consumer's toast can show exactly what
+//! git said. No auth handling at this layer — the user's git
+//! credential helper / SSH agent does the work.
+
+use std::path::Path;
+use std::process::Command;
+
+/// Run a sync op and return the combined stdout+stderr message
+/// regardless of success/failure. Network ops produce useful
+/// progress text on stderr that the consumer wants to see.
+fn run_sync(vault: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(vault)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git invocation failed: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stdout.is_empty() {
+        stderr.to_string()
+    } else if stderr.is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{stdout}{stderr}")
+    };
+    if !output.status.success() {
+        return Err(combined);
+    }
+    Ok(combined)
+}
+
+/// `git fetch [<remote>]`. When `remote` is None, fetches the
+/// default (`origin` if present, else the configured upstream).
+pub fn git_fetch(vault: &Path, remote: Option<&str>) -> Result<String, String> {
+    let mut args = vec!["fetch"];
+    if let Some(r) = remote {
+        args.push(r);
+    }
+    run_sync(vault, &args)
+}
+
+/// `git pull [<remote> <branch>]`. Both remote/branch are
+/// optional — passing None falls back to git's default upstream
+/// resolution.
+pub fn git_pull(
+    vault: &Path,
+    remote: Option<&str>,
+    branch: Option<&str>,
+) -> Result<String, String> {
+    let mut args = vec!["pull"];
+    if let Some(r) = remote {
+        args.push(r);
+        if let Some(b) = branch {
+            args.push(b);
+        }
+    }
+    run_sync(vault, &args)
+}
+
+/// `git push [<remote> <branch>]`. Same defaults as pull.
+pub fn git_push(
+    vault: &Path,
+    remote: Option<&str>,
+    branch: Option<&str>,
+) -> Result<String, String> {
+    let mut args = vec!["push"];
+    if let Some(r) = remote {
+        args.push(r);
+        if let Some(b) = branch {
+            args.push(b);
+        }
+    }
+    run_sync(vault, &args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_helpers::{commit_all, init_repo};
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn fetch_without_remote_returns_a_result() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("a"), "x").unwrap();
+        commit_all(dir.path(), "init");
+        // `git fetch` with no remote configured can be a silent
+        // success on some git versions (just walks an empty remote
+        // list) or an error on others. Either way the call must
+        // not panic — that's all we guard here.
+        let _ = git_fetch(dir.path(), None);
+    }
+
+    #[test]
+    fn pull_without_remote_errors_cleanly() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("a"), "x").unwrap();
+        commit_all(dir.path(), "init");
+        let r = git_pull(dir.path(), None, None);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn push_without_remote_errors_cleanly() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("a"), "x").unwrap();
+        commit_all(dir.path(), "init");
+        let r = git_push(dir.path(), None, None);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn fetch_against_local_remote_succeeds() {
+        // Set up two repos: a "remote" bare repo and a working
+        // repo that adds the bare repo as origin.
+        let remote = TempDir::new().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(remote.path())
+            .output()
+            .unwrap();
+        let local = TempDir::new().unwrap();
+        init_repo(local.path());
+        std::fs::write(local.path().join("a"), "x").unwrap();
+        commit_all(local.path(), "init");
+        Command::new("git")
+            .arg("-C")
+            .arg(local.path())
+            .args(["remote", "add", "origin"])
+            .arg(remote.path())
+            .output()
+            .unwrap();
+        let r = git_fetch(local.path(), Some("origin"));
+        // First fetch against an empty bare repo can be a no-op
+        // success or a "nothing to do"; either way it should NOT
+        // error.
+        assert!(r.is_ok(), "got: {:?}", r);
+    }
+}
