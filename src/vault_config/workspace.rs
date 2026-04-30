@@ -45,8 +45,18 @@ pub struct WorkspaceDefaults {
 pub struct FileSettings {
     /// Whether the editor toolbar's auto-capture toggle is on for this
     /// note. Off by default — captures are an opt-in surface.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_bool")]
     pub auto_capture: bool,
+    /// Whether the DocHeader card is in compact mode (only H1 + meta
+    /// strip visible). Off by default. Click-on-title in
+    /// `<DocHeaderCard>` toggles this; persistence keeps the
+    /// preference per-file across reopen.
+    #[serde(default, skip_serializing_if = "is_default_bool")]
+    pub docheader_compact: bool,
+}
+
+fn is_default_bool(b: &bool) -> bool {
+    !*b
 }
 
 impl FileSettings {
@@ -115,6 +125,64 @@ auto_capture = false
     #[test]
     fn file_settings_is_default_recognises_default_value() {
         assert!(FileSettings::default().is_default());
-        assert!(!FileSettings { auto_capture: true }.is_default());
+        assert!(
+            !FileSettings {
+                auto_capture: true,
+                docheader_compact: false,
+            }
+            .is_default()
+        );
+        assert!(
+            !FileSettings {
+                auto_capture: false,
+                docheader_compact: true,
+            }
+            .is_default()
+        );
+    }
+
+    #[test]
+    fn parses_docheader_compact_per_file() {
+        let raw = r#"
+version = "1"
+[files."notes/db.md"]
+docheader_compact = true
+"#;
+        let f: WorkspaceFile = toml::from_str(raw).unwrap();
+        assert!(f.files.get("notes/db.md").unwrap().docheader_compact);
+    }
+
+    #[test]
+    fn docheader_compact_false_omitted_from_serialize() {
+        // A file with auto_capture=true + docheader_compact=false (the
+        // default) should not write the compact key at all — keeps the
+        // TOML clean.
+        let mut f = WorkspaceFile::default();
+        f.files.insert(
+            "x.md".into(),
+            FileSettings {
+                auto_capture: true,
+                docheader_compact: false,
+            },
+        );
+        let raw = toml::to_string(&f).unwrap();
+        assert!(raw.contains("auto_capture"));
+        assert!(!raw.contains("docheader_compact"), "got: {raw}");
+    }
+
+    #[test]
+    fn docheader_compact_true_round_trips() {
+        let mut f = WorkspaceFile::default();
+        f.files.insert(
+            "x.md".into(),
+            FileSettings {
+                auto_capture: false,
+                docheader_compact: true,
+            },
+        );
+        let raw = toml::to_string(&f).unwrap();
+        let back: WorkspaceFile = toml::from_str(&raw).unwrap();
+        assert!(back.files.get("x.md").unwrap().docheader_compact);
+        assert!(!back.files.get("x.md").unwrap().auto_capture);
     }
 }
