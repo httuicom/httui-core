@@ -12,6 +12,8 @@
 //! `raw_yaml`, so this module owns the typed extraction for the
 //! `preflight:` section without touching the generic YAML parser.
 
+pub mod evaluator;
 pub mod parser;
 
+pub use evaluator::{evaluate_preflight, CheckResult, EvaluationContext};
 pub use parser::{parse_preflight, PreflightItem};
