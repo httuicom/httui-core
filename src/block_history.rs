@@ -425,6 +425,64 @@ mod tests {
         assert_eq!(rows.len(), 3);
     }
 
+    #[test]
+    fn insert_entry_round_trips_through_serde_with_plan_default() {
+        let json = r#"{
+            "file_path": "x.md",
+            "block_alias": "a",
+            "method": "GET",
+            "url_canonical": "/",
+            "status": 200,
+            "request_size": null,
+            "response_size": 12,
+            "elapsed_ms": 100,
+            "outcome": "success"
+        }"#;
+        let parsed: InsertEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.method, "GET");
+        assert!(parsed.plan.is_none(),
+                "plan should default to None when omitted from wire");
+    }
+
+    #[test]
+    fn insert_entry_accepts_explicit_plan_field() {
+        let json = r#"{
+            "file_path": "x.md",
+            "block_alias": "a",
+            "method": "POST",
+            "url_canonical": "/q",
+            "status": 200,
+            "request_size": null,
+            "response_size": null,
+            "elapsed_ms": null,
+            "outcome": "success",
+            "plan": "[{\"Plan\":{}}]"
+        }"#;
+        let parsed: InsertEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.plan.as_deref(), Some(r#"[{"Plan":{}}]"#));
+    }
+
+    #[test]
+    fn history_entry_clones_with_all_fields() {
+        let original = HistoryEntry {
+            id: 1,
+            file_path: "x.md".into(),
+            block_alias: "a".into(),
+            method: "GET".into(),
+            url_canonical: "/".into(),
+            status: Some(200),
+            request_size: Some(0),
+            response_size: Some(42),
+            elapsed_ms: Some(100),
+            outcome: "success".into(),
+            ran_at: "2026-04-30T16:00:00Z".into(),
+            plan: Some("[]".into()),
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned.id, 1);
+        assert_eq!(cloned.plan.as_deref(), Some("[]"));
+    }
+
     #[tokio::test]
     async fn get_retention_falls_back_to_default_for_invalid_value() {
         let pool = setup().await;
