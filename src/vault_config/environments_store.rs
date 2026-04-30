@@ -35,6 +35,12 @@ pub struct EnvironmentPublic {
     pub color: Option<String>,
     pub var_count: usize,
     pub secret_count: usize,
+    /// Canvas §6 Story 03 — `[meta].temporary`. Drives the
+    /// `temporary` chip in the Environments page.
+    pub temporary: bool,
+    /// Canvas §6 Story 03 — `[meta].connections_used` allowlist.
+    /// Empty list means "all connections".
+    pub connections_used: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -415,6 +421,8 @@ fn env_to_public(name: &str, file: &EnvFile) -> EnvironmentPublic {
         color: file.meta.color.clone(),
         var_count: file.vars.len(),
         secret_count: file.secrets.len(),
+        temporary: file.meta.temporary,
+        connections_used: file.meta.connections_used.clone(),
     }
 }
 

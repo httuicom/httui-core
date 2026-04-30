@@ -35,6 +35,17 @@ pub struct EnvMeta {
     pub require_confirm: bool,
     #[serde(default)]
     pub color: Option<String>,
+
+    /// Canvas §6 Story 03 — true marks the env as a throw-away (the
+    /// UI surfaces a `temporary` chip; user cleanup remains manual).
+    #[serde(default)]
+    pub temporary: bool,
+
+    /// Canvas §6 Story 03 — allowlist of connection IDs this env
+    /// may target. Empty list (default) means "all connections in
+    /// the vault are visible while this env is active".
+    #[serde(default)]
+    pub connections_used: Vec<String>,
 }
 
 #[cfg(test)]
@@ -80,6 +91,68 @@ color = "amber"
         assert!(f.vars.is_empty());
         assert!(f.secrets.is_empty());
         assert!(!f.meta.read_only);
+    }
+
+    #[test]
+    fn temporary_defaults_to_false() {
+        let raw = r#"version = "1""#;
+        let f: EnvFile = toml::from_str(raw).unwrap();
+        assert!(!f.meta.temporary);
+    }
+
+    #[test]
+    fn temporary_round_trips_through_serde() {
+        let raw = r#"
+version = "1"
+[meta]
+temporary = true
+"#;
+        let f: EnvFile = toml::from_str(raw).unwrap();
+        assert!(f.meta.temporary);
+        let back = toml::to_string(&f).unwrap();
+        assert!(back.contains("temporary = true"));
+    }
+
+    #[test]
+    fn connections_used_defaults_to_empty_meaning_all() {
+        let raw = r#"version = "1""#;
+        let f: EnvFile = toml::from_str(raw).unwrap();
+        assert!(f.meta.connections_used.is_empty());
+    }
+
+    #[test]
+    fn connections_used_round_trips_through_serde() {
+        let raw = r#"
+version = "1"
+[meta]
+connections_used = ["pg-staging", "redis-cache"]
+"#;
+        let f: EnvFile = toml::from_str(raw).unwrap();
+        assert_eq!(
+            f.meta.connections_used,
+            vec!["pg-staging".to_string(), "redis-cache".to_string()],
+        );
+        let back = toml::to_string(&f).unwrap();
+        assert!(back.contains("connections_used"));
+        assert!(back.contains("pg-staging"));
+    }
+
+    #[test]
+    fn pre_existing_envs_load_without_the_new_meta_fields() {
+        // Lazy-migration: an env file written before Story 03 has no
+        // `temporary` or `connections_used` keys. It must still parse
+        // and return defaults.
+        let raw = r#"
+version = "1"
+[vars]
+BASE_URL = "x"
+[meta]
+description = "older shape"
+"#;
+        let f: EnvFile = toml::from_str(raw).unwrap();
+        assert_eq!(f.meta.description.as_deref(), Some("older shape"));
+        assert!(!f.meta.temporary);
+        assert!(f.meta.connections_used.is_empty());
     }
 
     #[test]
