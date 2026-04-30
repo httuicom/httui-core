@@ -171,6 +171,33 @@ impl WorkspaceStore {
         self.persist(file).await
     }
 
+    /// Set the `docheader_compact` flag for `file_path`. Same prune
+    /// semantics as `set_file_auto_capture` — defaulted entries are
+    /// removed so workspace.toml stays minimal. Powers Epic 50
+    /// Story 06's compact-mode persistence.
+    pub async fn set_file_docheader_compact(
+        &self,
+        file_path: &str,
+        compact: bool,
+    ) -> Result<(), String> {
+        if file_path.trim().is_empty() {
+            return Err("file_path must not be empty".to_string());
+        }
+        let mut file = self.load_base_only().await?;
+        let mut entry = file
+            .files
+            .get(file_path)
+            .cloned()
+            .unwrap_or_default();
+        entry.docheader_compact = compact;
+        if entry.is_default() {
+            file.files.remove(file_path);
+        } else {
+            file.files.insert(file_path.to_string(), entry);
+        }
+        self.persist(file).await
+    }
+
     /// Ensure the file exists on disk. Idempotent — useful for the
     /// first-run flow that wants the file present before showing a UI.
     pub async fn ensure_exists(&self) -> Result<(), String> {
