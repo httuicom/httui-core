@@ -376,4 +376,88 @@ mod tests {
         let rows = list_history(&pool, "/notes/test.md", "req1").await.unwrap();
         assert!(rows.is_empty());
     }
+
+    #[tokio::test]
+    async fn purge_history_for_file_removes_all_aliases_in_file() {
+        let pool = setup().await;
+        let mut a = entry("GET", 200);
+        a.block_alias = "alpha".into();
+        insert_history_entry(&pool, a).await.unwrap();
+        let mut b = entry("GET", 200);
+        b.block_alias = "beta".into();
+        insert_history_entry(&pool, b).await.unwrap();
+        let mut other = entry("GET", 200);
+        other.file_path = "/other.md".into();
+        insert_history_entry(&pool, other).await.unwrap();
+
+        let removed = purge_history_for_file(&pool, "/notes/test.md")
+            .await
+            .unwrap();
+        assert_eq!(removed, 2);
+        // Other file's row survives.
+        assert_eq!(
+            list_history(&pool, "/other.md", "req1").await.unwrap().len(),
+            1,
+        );
+    }
+
+    #[tokio::test]
+    async fn get_retention_uses_app_config_when_set() {
+        let pool = setup().await;
+        // Create the app_config table that `get_retention` reads.
+        sqlx::query("CREATE TABLE app_config (key TEXT PRIMARY KEY, value TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO app_config (key, value) VALUES (?, ?)")
+            .bind(RETENTION_KEY)
+            .bind("3")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Insert 5 rows; trim should keep only the configured 3.
+        for i in 0..5 {
+            insert_history_entry(&pool, entry("GET", 200 + i))
+                .await
+                .unwrap();
+        }
+        let rows = list_history(&pool, "/notes/test.md", "req1").await.unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn get_retention_falls_back_to_default_for_invalid_value() {
+        let pool = setup().await;
+        sqlx::query("CREATE TABLE app_config (key TEXT PRIMARY KEY, value TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Negative value — treat as default (10).
+        sqlx::query("INSERT INTO app_config (key, value) VALUES (?, ?)")
+            .bind(RETENTION_KEY)
+            .bind("-5")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            insert_history_entry(&pool, entry("GET", 200)).await.unwrap();
+        }
+        // 2 rows fits the default cap (10) with room to spare.
+        let rows = list_history(&pool, "/notes/test.md", "req1").await.unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Replace with a non-numeric value — same fallback.
+        sqlx::query("UPDATE app_config SET value = ? WHERE key = ?")
+            .bind("not a number")
+            .bind(RETENTION_KEY)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            insert_history_entry(&pool, entry("GET", 200)).await.unwrap();
+        }
+        let rows = list_history(&pool, "/notes/test.md", "req1").await.unwrap();
+        // 4 inserted total, default cap is 10 — all 4 visible.
+        assert_eq!(rows.len(), 4);
+    }
 }
