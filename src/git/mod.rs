@@ -21,7 +21,7 @@ pub mod status;
 pub mod sync;
 
 pub use checkout::{git_checkout, git_checkout_b};
-pub use log::{git_log, CommitInfo};
+pub use log::{git_first_commit_author, git_log, CommitInfo};
 pub use remote::{git_remote_list, Remote};
 pub use remote_host::{parse_remote_url, ParsedRemote, RemoteHost};
 pub use staging::{git_commit, stage_path, unstage_path};

@@ -44,6 +44,35 @@ pub fn git_log(
     parse_log(&raw)
 }
 
+/// Return the commit that first added `path` to the repo, following
+/// renames. `None` when the path doesn't appear in any commit (a new
+/// untracked file or a path the caller invented). Powers the
+/// DocHeader meta strip's "author initials" chip (Epic 50 Story 03).
+///
+/// Implementation detail: `git log --follow --diff-filter=A -- <path>`
+/// returns every commit that *added* the path — usually one entry,
+/// or a chain when `--follow` walks renames. We pick the **last**
+/// (oldest) entry as the original author. Avoids `--reverse -n 1`,
+/// whose ordering interaction is git-version-dependent.
+pub fn git_first_commit_author(
+    vault: &Path,
+    path: &str,
+) -> Result<Option<CommitInfo>, String> {
+    let raw = run_git(
+        vault,
+        &[
+            "log",
+            "--follow",
+            "--diff-filter=A",
+            PRETTY,
+            "--",
+            path,
+        ],
+    )?;
+    let parsed = parse_log(&raw)?;
+    Ok(parsed.into_iter().last())
+}
+
 fn parse_log(raw: &str) -> Result<Vec<CommitInfo>, String> {
     let mut out = Vec::new();
     for record in raw.split(RS) {
@@ -188,5 +217,63 @@ mod tests {
         let bad = format!("sha{FS}sha{FS}n{FS}e@e{FS}not-a-number{FS}msg{RS}");
         let err = parse_log(&bad).unwrap_err();
         assert!(err.contains("bad timestamp"));
+    }
+
+    #[test]
+    fn first_commit_author_returns_creator_for_added_path() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        write(dir.path(), "runbooks", ""); // unused dir hint
+        write(dir.path(), "doc.md", "# v1\n");
+        let first_sha = commit_all(dir.path(), "add doc");
+        // Subsequent edit by the same author shouldn't shift the result.
+        write(dir.path(), "doc.md", "# v2\n");
+        commit_all(dir.path(), "edit doc");
+
+        let info = git_first_commit_author(dir.path(), "doc.md")
+            .unwrap()
+            .expect("doc.md was added");
+
+        assert_eq!(info.sha, first_sha);
+        assert_eq!(info.subject, "add doc");
+        assert_eq!(info.author_email, "test@httui.local");
+    }
+
+    #[test]
+    fn first_commit_author_is_none_for_unknown_path() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        write(dir.path(), "x", "1");
+        commit_all(dir.path(), "add x");
+
+        // The path was never committed — git log --diff-filter=A -- y
+        // produces an empty stdout, parse_log returns [] → None.
+        let info = git_first_commit_author(dir.path(), "y").unwrap();
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn first_commit_author_follows_renames() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        write(dir.path(), "old-name.md", "# x\n");
+        let first_sha = commit_all(dir.path(), "add file");
+
+        // Rename via git mv so the rename detection is unambiguous.
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["mv", "old-name.md", "new-name.md"])
+            .output()
+            .unwrap();
+        commit_all(dir.path(), "rename file");
+
+        let info = git_first_commit_author(dir.path(), "new-name.md")
+            .unwrap()
+            .expect("new-name.md was added (via rename)");
+
+        // --follow walks the rename chain back to the original add.
+        assert_eq!(info.sha, first_sha);
+        assert_eq!(info.subject, "add file");
     }
 }
