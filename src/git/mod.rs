@@ -16,12 +16,14 @@ pub mod checkout;
 pub mod log;
 pub mod remote;
 pub mod remote_host;
+pub mod staging;
 pub mod status;
 
 pub use checkout::{git_checkout, git_checkout_b};
 pub use log::{git_log, CommitInfo};
 pub use remote::{git_remote_list, Remote};
 pub use remote_host::{parse_remote_url, ParsedRemote, RemoteHost};
+pub use staging::{git_commit, stage_path, unstage_path};
 pub use status::{git_branch_list, git_diff, git_status, BranchInfo, GitStatus};
 
 use std::path::Path;
