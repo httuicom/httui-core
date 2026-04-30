@@ -66,6 +66,13 @@ pub struct UiPrefs {
     /// `theme` (legacy customisation JSON pending Epic 19 sweep).
     #[serde(default = "default_color_mode")]
     pub color_mode: String,
+    /// True when the user has dismissed the MVP-to-v1 migration
+    /// banner. Surfaced in the Empty state when a legacy `notes.db`
+    /// is detected without a `.httui/` v1 layout. Once dismissed,
+    /// the banner stays hidden across launches (Epic 41 Story 07
+    /// carry).
+    #[serde(default)]
+    pub mvp_migration_dismissed: bool,
 }
 
 impl Default for UiPrefs {
@@ -81,6 +88,7 @@ impl Default for UiPrefs {
             vim_enabled: false,
             sidebar_open: default_sidebar_open(),
             color_mode: default_color_mode(),
+            mvp_migration_dismissed: false,
         }
     }
 }
@@ -217,6 +225,27 @@ prompt_timeout_s = 30
         assert!(!p.vim_enabled);
         assert!(p.sidebar_open);
         assert_eq!(p.color_mode, "system");
+        assert!(!p.mvp_migration_dismissed);
+    }
+
+    #[test]
+    fn mvp_migration_dismissed_round_trips() {
+        let raw = "version = \"1\"\n[ui]\nmvp_migration_dismissed = true\n";
+        let f: UserFile = toml::from_str(raw).unwrap();
+        assert!(f.ui.mvp_migration_dismissed);
+
+        let serialized = toml::to_string(&f).unwrap();
+        assert!(serialized.contains("mvp_migration_dismissed = true"));
+
+        let back: UserFile = toml::from_str(&serialized).unwrap();
+        assert!(back.ui.mvp_migration_dismissed);
+    }
+
+    #[test]
+    fn mvp_migration_dismissed_defaults_to_false_when_omitted() {
+        let raw = "version = \"1\"\n[ui]\ntheme = \"dark\"\n";
+        let f: UserFile = toml::from_str(raw).unwrap();
+        assert!(!f.ui.mvp_migration_dismissed);
     }
 
     #[test]
