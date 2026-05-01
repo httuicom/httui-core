@@ -182,6 +182,45 @@ pub fn trim_run_bodies(
     Ok(deleted)
 }
 
+/// Move every cached run body for `(file_path, old_alias)` to
+/// `(file_path, new_alias)`. Powers the "alias rename" carry from
+/// Epic 47 Story 05: when the user renames a block's `alias=` info-
+/// string token, the on-disk run history follows so older diffs
+/// stay reachable from the new alias.
+///
+/// Best-effort:
+/// - Returns `Ok(false)` when the source dir doesn't exist (the
+///   block has never run with that alias — nothing to move).
+/// - Returns `Err` when the destination dir already exists. The
+///   consumer should refuse the rename (or pick a different new
+///   alias) rather than have us merge two histories.
+/// - Returns `Err` when either alias fails the same sanitization
+///   used by `write_run_body`.
+pub fn rename_alias_runs(
+    vault_root: &Path,
+    file_path: &str,
+    old_alias: &str,
+    new_alias: &str,
+) -> Result<bool, String> {
+    let old_dir = block_dir_for(vault_root, file_path, old_alias)?;
+    let new_dir = block_dir_for(vault_root, file_path, new_alias)?;
+    if !old_dir.exists() {
+        return Ok(false);
+    }
+    if new_dir.exists() {
+        return Err(format!(
+            "destination alias `{new_alias}` already has cached runs",
+        ));
+    }
+    if let Some(parent) = new_dir.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create_dir_all failed: {e}"))?;
+    }
+    fs::rename(&old_dir, &new_dir)
+        .map_err(|e| format!("rename failed: {e}"))?;
+    Ok(true)
+}
+
 fn ext_for(kind: RunBodyKind) -> &'static str {
     match kind {
         RunBodyKind::Json => "json",
@@ -545,5 +584,87 @@ mod tests {
         // No leftover .tmp file.
         let entries = list_run_bodies(dir.path(), "x.md", "a").unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn rename_alias_moves_existing_runs() {
+        let dir = tempdir().unwrap();
+        for run_id in ["r1", "r2", "r3"] {
+            write_run_body(
+                dir.path(),
+                "rb.md",
+                "old",
+                run_id,
+                RunBodyKind::Json,
+                b"{}",
+            )
+            .unwrap();
+        }
+        let moved = rename_alias_runs(dir.path(), "rb.md", "old", "new").unwrap();
+        assert!(moved);
+        let from_old = list_run_bodies(dir.path(), "rb.md", "old").unwrap();
+        let from_new = list_run_bodies(dir.path(), "rb.md", "new").unwrap();
+        assert!(from_old.is_empty(), "old alias dir should be gone");
+        assert_eq!(from_new.len(), 3);
+        // Files keep the same names; only the parent dir changed.
+        let stems: Vec<_> = from_new.iter().map(|e| e.run_id.as_str()).collect();
+        assert!(stems.contains(&"r1"));
+        assert!(stems.contains(&"r2"));
+        assert!(stems.contains(&"r3"));
+    }
+
+    #[test]
+    fn rename_alias_returns_false_when_source_missing() {
+        let dir = tempdir().unwrap();
+        // Nothing has run yet — no source dir.
+        let moved =
+            rename_alias_runs(dir.path(), "rb.md", "missing", "fresh").unwrap();
+        assert!(!moved);
+    }
+
+    #[test]
+    fn rename_alias_errors_when_destination_already_has_runs() {
+        let dir = tempdir().unwrap();
+        write_run_body(
+            dir.path(),
+            "rb.md",
+            "src",
+            "r1",
+            RunBodyKind::Json,
+            b"{}",
+        )
+        .unwrap();
+        write_run_body(
+            dir.path(),
+            "rb.md",
+            "dst",
+            "r1",
+            RunBodyKind::Json,
+            b"{}",
+        )
+        .unwrap();
+        let err =
+            rename_alias_runs(dir.path(), "rb.md", "src", "dst").unwrap_err();
+        assert!(err.contains("already"));
+        // Source still in place — caller can resolve and retry.
+        let from_src = list_run_bodies(dir.path(), "rb.md", "src").unwrap();
+        assert_eq!(from_src.len(), 1);
+    }
+
+    #[test]
+    fn rename_alias_rejects_invalid_alias_names() {
+        let dir = tempdir().unwrap();
+        let err =
+            rename_alias_runs(dir.path(), "rb.md", "ok", "bad/slash")
+                .unwrap_err();
+        assert!(err.contains("invalid char"));
+    }
+
+    #[test]
+    fn rename_alias_rejects_traversal_in_file_path() {
+        let dir = tempdir().unwrap();
+        let err =
+            rename_alias_runs(dir.path(), "../escape.md", "a", "b").unwrap_err();
+        assert!(err.contains(".."));
     }
 }
