@@ -6,12 +6,11 @@
 //! tracking lives in the per-machine `user.toml` so the same shared
 //! vault can have different active envs on different machines.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use serde::Serialize;
 use tokio::sync::RwLock;
 
 use crate::db::keychain::{delete_secret, env_var_key, get_secret, store_secret};
@@ -24,43 +23,10 @@ use super::user::UserFile;
 use super::validate::{validate_env_file, Severity};
 use super::Version;
 
-// --- DTOs --------------------------------------------------------------------
+mod dto;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct EnvironmentPublic {
-    pub name: String,
-    pub description: Option<String>,
-    pub read_only: bool,
-    pub require_confirm: bool,
-    pub color: Option<String>,
-    pub var_count: usize,
-    pub secret_count: usize,
-    /// Canvas §6 `[meta].temporary`. Drives the
-    /// `temporary` chip in the Environments page.
-    pub temporary: bool,
-    /// Canvas §6 `[meta].connections_used` allowlist.
-    /// Empty list means "all connections".
-    pub connections_used: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct EnvVariablePublic {
-    pub key: String,
-    /// Plaintext value when from `[vars]`; empty string when from
-    /// `[secrets]` (caller resolves on demand).
-    pub value: String,
-    pub is_secret: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct SetVarInput {
-    pub env_name: String,
-    pub key: String,
-    /// Raw value. For secret vars it's stored in the keychain and the
-    /// TOML keeps only a `{{keychain:...}}` reference.
-    pub value: String,
-    pub is_secret: bool,
-}
+use dto::{env_to_public, is_valid_env_name};
+pub use dto::{EnvVariablePublic, EnvironmentPublic, SetVarInput};
 
 // --- Cache -------------------------------------------------------------------
 
@@ -80,6 +46,14 @@ pub struct EnvironmentsStore {
     user_config_path: PathBuf,
     /// Per-env cache. Key is the env name (== filename stem).
     cache: RwLock<BTreeMap<String, CachedEnv>>,
+    /// Process-lifetime cache of secrets already resolved through the
+    /// keychain. Key is the canonical kc_key (`env:<env>:<var>`); value
+    /// is the raw secret. Without it, every HTTP/DB run triggers a
+    /// fresh keychain prompt on macOS (the OS only remembers "Always
+    /// Allow" for code-signed binaries, which dev builds aren't).
+    /// Invalidated on rotate/delete/rename so we never serve a stale
+    /// value.
+    secrets_cache: RwLock<HashMap<String, String>>,
 }
 
 impl EnvironmentsStore {
@@ -88,7 +62,46 @@ impl EnvironmentsStore {
             vault_root: vault_root.into(),
             user_config_path: user_config_path.into(),
             cache: RwLock::new(BTreeMap::new()),
+            secrets_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Resolve a single keychain ref, consulting the in-process cache
+    /// first. Misses delegate to `resolve_value` and populate the cache
+    /// on success. Failures are not cached — a transient backend hiccup
+    /// shouldn't poison the entry.
+    async fn resolve_secret_cached(
+        &self,
+        kc_key: &str,
+        reference: &str,
+    ) -> Result<Option<String>, String> {
+        {
+            let cache = self.secrets_cache.read().await;
+            if let Some(value) = cache.get(kc_key) {
+                return Ok(Some(value.clone()));
+            }
+        }
+        let resolved = resolve_value(reference)?;
+        if let Some(value) = &resolved {
+            let mut cache = self.secrets_cache.write().await;
+            cache.insert(kc_key.to_string(), value.clone());
+        }
+        Ok(resolved)
+    }
+
+    async fn drop_cached_secret(&self, kc_key: &str) {
+        let mut cache = self.secrets_cache.write().await;
+        cache.remove(kc_key);
+    }
+
+    async fn update_cached_secret(&self, kc_key: &str, value: &str) {
+        let mut cache = self.secrets_cache.write().await;
+        cache.insert(kc_key.to_string(), value.to_string());
+    }
+
+    async fn drop_cached_secrets_with_prefix(&self, prefix: &str) {
+        let mut cache = self.secrets_cache.write().await;
+        cache.retain(|k, _| !k.starts_with(prefix));
     }
 
     fn envs_dir(&self) -> PathBuf {
@@ -168,6 +181,9 @@ impl EnvironmentsStore {
     pub async fn invalidate_cache(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
+        drop(cache);
+        let mut secrets = self.secrets_cache.write().await;
+        secrets.clear();
     }
 
     /// Read a single env's base file (no `.local` merge). Mutating
@@ -253,6 +269,8 @@ impl EnvironmentsStore {
                 let _ = delete_secret(&env_var_key(name, key));
             }
         }
+        self.drop_cached_secrets_with_prefix(&format!("env:{name}:"))
+            .await;
         std::fs::remove_file(&path).map_err(|e| format!("delete {}: {e}", path.display()))?;
         // Drop the local override file too so a stale `<name>.local.toml`
         // doesn't resurrect the env on next load.
@@ -301,9 +319,12 @@ impl EnvironmentsStore {
                 if let Ok(Some(value)) = get_secret(&kc_old) {
                     let _ = store_secret(&kc_new, &value);
                     let _ = delete_secret(&kc_old);
+                    self.update_cached_secret(&kc_new, &value).await;
                 }
             }
         }
+        self.drop_cached_secrets_with_prefix(&format!("env:{old_name}:"))
+            .await;
         std::fs::rename(&old_path, &new_path).map_err(|e| {
             format!(
                 "rename {} → {}: {e}",
@@ -360,6 +381,47 @@ impl EnvironmentsStore {
         Ok(out)
     }
 
+    /// Same shape as `list_vars`, but secrets are pre-resolved through
+    /// the keychain. Use this for execution paths (HTTP/DB block ref
+    /// resolution) — never for UI listing, where the value must stay
+    /// masked.
+    ///
+    /// Best-effort per key: a missing or broken keychain entry leaves
+    /// that secret with an empty value instead of failing the whole
+    /// env, so the surrounding plain vars still resolve.
+    pub async fn list_vars_resolved(
+        &self,
+        env_name: &str,
+    ) -> Result<Vec<EnvVariablePublic>, String> {
+        let Some(file) = self.load_env(env_name).await? else {
+            return Err(format!("environment '{env_name}' not found"));
+        };
+        let mut out = Vec::new();
+        for (key, value) in &file.vars {
+            out.push(EnvVariablePublic {
+                key: key.clone(),
+                value: value.clone(),
+                is_secret: false,
+            });
+        }
+        for (key, reference) in &file.secrets {
+            let kc_key = env_var_key(env_name, key);
+            let value = self
+                .resolve_secret_cached(&kc_key, reference)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            out.push(EnvVariablePublic {
+                key: key.clone(),
+                value,
+                is_secret: true,
+            });
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+
     /// Resolve a var for actual execution. Secrets pass through the
     /// keychain. Plain `[vars]` come back verbatim.
     pub async fn resolve_var(&self, env_name: &str, key: &str) -> Result<Option<String>, String> {
@@ -370,7 +432,11 @@ impl EnvironmentsStore {
             return Ok(Some(v.clone()));
         }
         if let Some(reference) = file.secrets.get(key) {
-            return resolve_value(reference).map_err(|e| format!("resolving secret '{key}': {e}"));
+            let kc_key = env_var_key(env_name, key);
+            return self
+                .resolve_secret_cached(&kc_key, reference)
+                .await
+                .map_err(|e| format!("resolving secret '{key}': {e}"));
         }
         Ok(None)
     }
@@ -395,17 +461,34 @@ impl EnvironmentsStore {
             .ok_or_else(|| format!("environment '{env_name}' not found"))?;
 
         if is_secret {
-            // Move plaintext to keychain; write only the reference into
-            // the TOML.
-            let kc_key = env_var_key(&env_name, &key);
-            let reference = ensure_keychain_ref(&kc_key, &value)?;
-            // If a same-named non-secret existed, remove it.
-            file.vars.remove(&key);
-            file.secrets.insert(key.clone(), reference);
+            // Empty value means "keep the existing keychain entry" — same rule
+            // as connection passwords. The UI never exposes the secret in
+            // edit forms, so any edit that only touches key/is_secret/etc.
+            // submits value="". Treating that as a wipe would silently
+            // destroy the secret on save.
+            if value.is_empty() {
+                if let Some(existing_ref) = file.secrets.get(&key).cloned() {
+                    file.vars.remove(&key);
+                    file.secrets.insert(key.clone(), existing_ref);
+                } else {
+                    return Err("value is required for new secret".to_string());
+                }
+            } else {
+                // Move plaintext to keychain; write only the reference into
+                // the TOML.
+                let kc_key = env_var_key(&env_name, &key);
+                let reference = ensure_keychain_ref(&kc_key, &value)?;
+                // If a same-named non-secret existed, remove it.
+                file.vars.remove(&key);
+                file.secrets.insert(key.clone(), reference);
+                self.update_cached_secret(&kc_key, &value).await;
+            }
         } else {
             // If a same-named secret existed, drop the keychain entry.
             if file.secrets.remove(&key).is_some() {
-                let _ = delete_secret(&env_var_key(&env_name, &key));
+                let kc_key = env_var_key(&env_name, &key);
+                let _ = delete_secret(&kc_key);
+                self.drop_cached_secret(&kc_key).await;
             }
             file.vars.insert(key.clone(), value);
         }
@@ -432,7 +515,9 @@ impl EnvironmentsStore {
             ));
         }
         if removed_secret {
-            let _ = delete_secret(&env_var_key(env_name, key));
+            let kc_key = env_var_key(env_name, key);
+            let _ = delete_secret(&kc_key);
+            self.drop_cached_secret(&kc_key).await;
         }
         self.persist_env(env_name, file).await?;
         Ok(())
@@ -485,29 +570,6 @@ impl EnvironmentsStore {
     }
 }
 
-// --- conversion helpers --------------------------------------------------
-
-fn env_to_public(name: &str, file: &EnvFile) -> EnvironmentPublic {
-    EnvironmentPublic {
-        name: name.to_string(),
-        description: file.meta.description.clone(),
-        read_only: file.meta.read_only,
-        require_confirm: file.meta.require_confirm,
-        color: file.meta.color.clone(),
-        var_count: file.vars.len(),
-        secret_count: file.secrets.len(),
-        temporary: file.meta.temporary,
-        connections_used: file.meta.connections_used.clone(),
-    }
-}
-
-fn is_valid_env_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 #[cfg(test)]
 // Tests serialize keychain access via KEYCHAIN_TEST_LOCK; the std Mutex
 // guard is intentionally held across awaits to keep concurrent test
@@ -516,7 +578,7 @@ fn is_valid_env_name(name: &str) -> bool {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::db::keychain::KEYCHAIN_TEST_LOCK;
+    use crate::db::keychain::{force_keychain_failure, KEYCHAIN_TEST_LOCK};
     use tempfile::TempDir;
 
     fn fresh_store() -> (Arc<EnvironmentsStore>, TempDir) {
@@ -621,6 +683,230 @@ mod tests {
 
         // Cleanup
         let _ = delete_secret(&env_var_key(&env_name, "ADMIN_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn editing_secret_with_empty_value_preserves_keychain() {
+        // Regression: V4 hotfix 2026-05-23. list_vars masks secrets as
+        // value="", so any edit that only touches key/is_secret submits
+        // value="" — previously that wiped the keychain entry on save.
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("edit-empty");
+        store.create_env(&env_name).await.unwrap();
+
+        // Seed a real secret.
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "API_TOKEN".into(),
+                value: "real-secret-42".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        // Simulate the UI re-saving with an empty value (form was opened
+        // for edit; list_vars never gave the real value to the form).
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "API_TOKEN".into(),
+                value: String::new(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        // resolve_var must still return the original value.
+        let resolved = store
+            .resolve_var(&env_name, "API_TOKEN")
+            .await
+            .unwrap()
+            .expect("secret must still resolve");
+        assert_eq!(resolved, "real-secret-42");
+
+        // Cleanup
+        let _ = delete_secret(&env_var_key(&env_name, "API_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn creating_secret_with_empty_value_errors() {
+        // Companion to the preserve test: empty + is_secret on a brand-new
+        // key has nothing to preserve, so it must error instead of
+        // silently writing an empty-string secret.
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("create-empty");
+        store.create_env(&env_name).await.unwrap();
+
+        let err = store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "BRAND_NEW".into(),
+                value: String::new(),
+                is_secret: true,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("value is required"));
+
+        // And the env file must not have a `BRAND_NEW` entry anywhere.
+        let vars = store.list_vars(&env_name).await.unwrap();
+        assert!(vars.iter().all(|v| v.key != "BRAND_NEW"));
+    }
+
+    #[tokio::test]
+    async fn list_vars_resolved_returns_real_secret_value() {
+        // Regression: list_vars masks secrets with value="", so any
+        // caller that fed `list_vars` into a ref-resolution map (HTTP/DB
+        // block dispatch) was silently sending the empty string for
+        // {{SECRET_KEY}}. list_vars_resolved must hit the keychain.
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("resolved");
+        store.create_env(&env_name).await.unwrap();
+
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "real-42".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        let vars = store.list_vars_resolved(&env_name).await.unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].key, "TOKEN");
+        assert!(vars[0].is_secret);
+        assert_eq!(vars[0].value, "real-42");
+
+        let _ = delete_secret(&env_var_key(&env_name, "TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn list_vars_resolved_mixes_plain_and_secret() {
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("mixed");
+        store.create_env(&env_name).await.unwrap();
+
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "BASE_URL".into(),
+                value: "https://api.example.com".into(),
+                is_secret: false,
+            })
+            .await
+            .unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "secret-abc".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        let vars = store.list_vars_resolved(&env_name).await.unwrap();
+        let by_key: std::collections::HashMap<_, _> = vars
+            .into_iter()
+            .map(|v| (v.key, (v.value, v.is_secret)))
+            .collect();
+        assert_eq!(
+            by_key["BASE_URL"],
+            ("https://api.example.com".into(), false)
+        );
+        assert_eq!(by_key["TOKEN"], ("secret-abc".into(), true));
+
+        let _ = delete_secret(&env_var_key(&env_name, "TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn list_vars_resolved_keeps_plain_when_secret_missing() {
+        // A keychain entry can go missing (machine swap, manual purge,
+        // backend hiccup). One broken secret must not blank-out every
+        // other variable in the env.
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("missing");
+        store.create_env(&env_name).await.unwrap();
+
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "BASE_URL".into(),
+                value: "https://api.example.com".into(),
+                is_secret: false,
+            })
+            .await
+            .unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "stored".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        // Yank the keychain entry behind the reference; the TOML still
+        // has the {{keychain:…}} ref. invalidate_cache simulates a
+        // process restart — the in-memory secrets cache is populated by
+        // `set_var` above, so without invalidation list_vars_resolved
+        // would (correctly) hit the cache.
+        let _ = delete_secret(&env_var_key(&env_name, "TOKEN"));
+        store.invalidate_cache().await;
+
+        let vars = store.list_vars_resolved(&env_name).await.unwrap();
+        let by_key: std::collections::HashMap<_, _> =
+            vars.into_iter().map(|v| (v.key, v.value)).collect();
+        assert_eq!(by_key["BASE_URL"], "https://api.example.com");
+        assert_eq!(by_key["TOKEN"], ""); // best-effort fallback
+    }
+
+    #[tokio::test]
+    async fn editing_secret_with_new_value_overwrites_keychain() {
+        // Make sure the "empty preserves" path doesn't block legitimate
+        // rotations: re-saving with a non-empty value still rewrites the
+        // keychain entry to the new secret.
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("rotate");
+        store.create_env(&env_name).await.unwrap();
+
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "ROT".into(),
+                value: "v1".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "ROT".into(),
+                value: "v2".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        let resolved = store
+            .resolve_var(&env_name, "ROT")
+            .await
+            .unwrap()
+            .expect("rotated secret must resolve");
+        assert_eq!(resolved, "v2");
+
+        let _ = delete_secret(&env_var_key(&env_name, "ROT"));
     }
 
     #[tokio::test]
@@ -942,8 +1228,13 @@ BASE_URL = "http://localhost"
             .unwrap();
 
         // Delete the keychain entry behind the reference; the TOML
-        // still has the {{keychain:...}} reference.
+        // still has the {{keychain:...}} reference. invalidate_cache
+        // mimics a process restart so the secrets cache (populated by
+        // set_var above) doesn't shield the missing entry — without
+        // invalidation, the cache hit would (correctly) return the
+        // stored value.
         let _ = delete_secret(&env_var_key(&env_name, "ORPHAN"));
+        store.invalidate_cache().await;
 
         let err = store
             .resolve_var(&env_name, "ORPHAN")
@@ -1076,5 +1367,146 @@ BASE_URL = "http://localhost"
             "list must not surface .local as separate env"
         );
         assert_eq!(envs[0].name, "staging");
+    }
+
+    #[tokio::test]
+    async fn secrets_cache_avoids_second_keychain_call() {
+        // The whole point of the in-memory secrets cache: after the
+        // first resolve, subsequent calls in the same process don't
+        // touch the keychain — which on macOS means no second prompt.
+        // Simulating that here: pre-seed, resolve once (populates
+        // cache), force every keychain call to error, resolve again,
+        // assert it still returns the original value.
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("cache-hit");
+        store.create_env(&env_name).await.unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "v1".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        // First resolve populates the cache. set_var also primes it
+        // on the write path, so this is belt-and-suspenders.
+        assert_eq!(
+            store.resolve_var(&env_name, "TOKEN").await.unwrap(),
+            Some("v1".into())
+        );
+
+        // From now on every keychain op errors. A cache miss would
+        // surface that error; a cache hit ignores the backend entirely.
+        force_keychain_failure(true);
+        let resolved = store.resolve_var(&env_name, "TOKEN").await;
+        let listed = store.list_vars_resolved(&env_name).await.unwrap();
+        force_keychain_failure(false);
+
+        assert_eq!(resolved.unwrap(), Some("v1".into()));
+        let by_key: std::collections::HashMap<_, _> =
+            listed.into_iter().map(|v| (v.key, v.value)).collect();
+        assert_eq!(by_key["TOKEN"], "v1");
+
+        let _ = delete_secret(&env_var_key(&env_name, "TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn secrets_cache_refreshes_on_rotation() {
+        // set_var with a new value must update the cache in lockstep
+        // with the keychain — otherwise an immediate read would still
+        // serve the old value until something invalidated.
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("cache-rotate");
+        store.create_env(&env_name).await.unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "old".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "new".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+
+        // Block keychain so any cache miss would error. A correctly
+        // refreshed cache returns "new" without touching the backend.
+        force_keychain_failure(true);
+        let resolved = store.resolve_var(&env_name, "TOKEN").await;
+        force_keychain_failure(false);
+        assert_eq!(resolved.unwrap(), Some("new".into()));
+
+        let _ = delete_secret(&env_var_key(&env_name, "TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn delete_env_clears_secrets_cache() {
+        // After delete_env, a recreated env with the same name and key
+        // must NOT serve the old cached value.
+        let _guard = KEYCHAIN_TEST_LOCK.lock().unwrap();
+        let (store, _t) = fresh_store();
+        let env_name = unique_name("cache-delete");
+        store.create_env(&env_name).await.unwrap();
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "first".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+        // Touch the resolve path to populate the cache.
+        let _ = store.resolve_var(&env_name, "TOKEN").await;
+        store.delete_env(&env_name).await.unwrap();
+
+        // After delete_env nuked the cache prefix, force keychain off.
+        // Recreating + re-setting must populate from the new write,
+        // not return the old "first".
+        force_keychain_failure(true);
+        store.create_env(&env_name).await.unwrap();
+        let set_result = store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "second".into(),
+                is_secret: true,
+            })
+            .await;
+        force_keychain_failure(false);
+        // set_var hits the keychain via ensure_keychain_ref → expected
+        // to error here, proving we're not relying on any leftover
+        // cache or sibling state.
+        assert!(set_result.is_err());
+
+        // And finally, with keychain back on, a fresh write writes the
+        // new value cleanly.
+        store
+            .set_var(SetVarInput {
+                env_name: env_name.clone(),
+                key: "TOKEN".into(),
+                value: "second".into(),
+                is_secret: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.resolve_var(&env_name, "TOKEN").await.unwrap(),
+            Some("second".into())
+        );
+
+        let _ = delete_secret(&env_var_key(&env_name, "TOKEN"));
     }
 }
