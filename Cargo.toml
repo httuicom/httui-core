@@ -1,14 +1,14 @@
 [package]
 name = "httui-core"
 description = "Shared core for httui (executors, DB, references, secrets)"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
-homepage.workspace = true
-documentation.workspace = true
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["João Ferreira <joao@httui.com>"]
+repository = "https://github.com/httuicom/httui-core"
+homepage = "https://httui.com"
+documentation = "https://github.com/httuicom/httui-core#readme"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
