@@ -1,6 +1,7 @@
 pub mod block_examples;
 pub mod block_history;
 pub mod block_results;
+pub mod block_schema;
 pub mod block_settings;
 pub mod blocks;
 pub mod captures_cache;
