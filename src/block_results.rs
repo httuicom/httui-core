@@ -192,6 +192,15 @@ pub async fn save_block_result_with_alias(
     .execute(pool)
     .await?;
 
+    // Successful runs also refresh the inferred shape so ref resolution
+    // (language server) sees the fields of the latest response.
+    // Best-effort: a non-JSON response simply has no shape.
+    if let (Some(alias), "success") = (alias, status) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(response) {
+            let _ = crate::block_schema::upsert_block_schema(pool, file_path, alias, &json).await;
+        }
+    }
+
     Ok(())
 }
 

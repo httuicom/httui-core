@@ -38,6 +38,7 @@ const MIGRATION_011_SQL: &str = include_str!("../../migrations/011_block_example
 const MIGRATION_012_SQL: &str = include_str!("../../migrations/012_block_run_history_plan.sql");
 const MIGRATION_013_SQL: &str = include_str!("../../migrations/013_schema_cache_drop_fk.sql");
 const MIGRATION_014_SQL: &str = include_str!("../../migrations/014_block_results_alias.sql");
+const MIGRATION_015_SQL: &str = include_str!("../../migrations/015_block_schema_cache.sql");
 
 pub async fn init_db(app_data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
     std::fs::create_dir_all(app_data_dir).ok();
@@ -259,6 +260,13 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let trimmed = statement.trim();
         if !trimmed.is_empty() {
             let _ = sqlx::query(trimmed).execute(pool).await;
+        }
+    }
+
+    for statement in MIGRATION_015_SQL.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            sqlx::query(trimmed).execute(pool).await?;
         }
     }
 
