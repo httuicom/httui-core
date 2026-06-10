@@ -45,9 +45,12 @@ pub async fn init_db(app_data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
     let db_path = app_data_dir.join("notes.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
+    // WAL so external read-only consumers (the language server reads the
+    // schema/env tables) are never blocked by the app's writes.
     let options = SqliteConnectOptions::from_str(&db_url)?
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -266,6 +269,17 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_init_db_enables_wal() {
+        let tmp = TempDir::new().unwrap();
+        let pool = init_db(tmp.path()).await.unwrap();
+        let row: (String,) = sqlx::query_as("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0.to_lowercase(), "wal");
+    }
 
     #[tokio::test]
     async fn test_init_db_creates_file_and_runs_migrations() {
