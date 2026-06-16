@@ -7,6 +7,7 @@ pub mod blocks;
 pub mod captures_cache;
 pub mod config;
 pub mod connection_uses;
+pub mod crash_log;
 pub mod db;
 pub mod dotenv;
 pub mod error;
