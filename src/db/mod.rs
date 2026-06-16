@@ -2,6 +2,7 @@ pub mod chat;
 pub mod connections;
 pub mod driver;
 pub mod environments;
+pub mod feature_usage;
 pub mod keychain;
 pub mod lookup;
 pub mod pool;
@@ -39,6 +40,7 @@ const MIGRATION_012_SQL: &str = include_str!("../../migrations/012_block_run_his
 const MIGRATION_013_SQL: &str = include_str!("../../migrations/013_schema_cache_drop_fk.sql");
 const MIGRATION_014_SQL: &str = include_str!("../../migrations/014_block_results_alias.sql");
 const MIGRATION_015_SQL: &str = include_str!("../../migrations/015_block_schema_cache.sql");
+const MIGRATION_016_SQL: &str = include_str!("../../migrations/016_feature_usage_stats.sql");
 
 pub async fn init_db(app_data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
     std::fs::create_dir_all(app_data_dir).ok();
@@ -264,6 +266,13 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     }
 
     for statement in MIGRATION_015_SQL.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            sqlx::query(trimmed).execute(pool).await?;
+        }
+    }
+
+    for statement in MIGRATION_016_SQL.split(';') {
         let trimmed = statement.trim();
         if !trimmed.is_empty() {
             sqlx::query(trimmed).execute(pool).await?;

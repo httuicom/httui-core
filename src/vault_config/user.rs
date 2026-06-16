@@ -132,6 +132,11 @@ pub struct UiPrefs {
     /// this; `useAutoUpdate` reads it to gate the update prompt.
     #[serde(default)]
     pub auto_update_include_prereleases: bool,
+    /// Opt-in to local feature-usage tracking. Default `false`. When
+    /// off, the desktop never records block-run counts. Aggregated
+    /// counts stay on-machine in `notes.db` — nothing is ever uploaded.
+    #[serde(default)]
+    pub telemetry_enabled: bool,
 }
 
 impl Default for UiPrefs {
@@ -153,6 +158,7 @@ impl Default for UiPrefs {
             hide_archived_in_quick_open: false,
             shortcut_profile: default_shortcut_profile(),
             auto_update_include_prereleases: false,
+            telemetry_enabled: false,
         }
     }
 }
@@ -393,6 +399,26 @@ line_start = 0
         let raw = "version = \"1\"\n[ui]\ntheme = \"dark\"\n";
         let f: UserFile = toml::from_str(raw).unwrap();
         assert!(!f.ui.auto_update_include_prereleases);
+    }
+
+    #[test]
+    fn telemetry_enabled_round_trips() {
+        let raw = "version = \"1\"\n[ui]\ntelemetry_enabled = true\n";
+        let f: UserFile = toml::from_str(raw).unwrap();
+        assert!(f.ui.telemetry_enabled);
+
+        let serialized = toml::to_string(&f).unwrap();
+        assert!(serialized.contains("telemetry_enabled = true"));
+
+        let back: UserFile = toml::from_str(&serialized).unwrap();
+        assert!(back.ui.telemetry_enabled);
+    }
+
+    #[test]
+    fn telemetry_enabled_defaults_to_false_when_omitted() {
+        let raw = "version = \"1\"\n[ui]\ntheme = \"dark\"\n";
+        let f: UserFile = toml::from_str(raw).unwrap();
+        assert!(!f.ui.telemetry_enabled);
     }
 
     #[test]
